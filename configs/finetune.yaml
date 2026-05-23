@@ -1,0 +1,28 @@
+seed: 42
+
+dataset_path: datasets/brats_ped
+
+save_dir: outputs/checkpoints/
+log_dir: outputs/logs/
+
+device: cuda
+
+batch_size: 1
+epochs: 80
+
+learning_rate: 0.00005
+weight_decay: 0.00001
+
+patch_size:
+  - 96
+  - 96
+  - 96
+
+num_workers: 2
+
+pretrained_weights:
+  pretrained_weights/ssl_encoder.pth
+
+use_amp: true
+
+train_split: 0.8

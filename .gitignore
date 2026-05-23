@@ -1,0 +1,86 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ==========================
+# IDE / Editor
+# ==========================
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Logs
+# ==========================
+logs/
+*.log
+
+# ==========================
+# Dataset files
+# ==========================
+datasets/
+temp_extract/
+raw.zip
+raw.tar
+raw.tar.gz
+*.nii
+*.nii.gz
+
+# ==========================
+# Model outputs
+# ==========================
+outputs/
+pretrained_weights/
+checkpoints/
+
+# PyTorch checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# TensorBoard
+runs/
+
+# ==========================
+# Temporary files
+# ==========================
+tmp/
+temp/
+.cache/
+
+# ==========================
+# Kaggle / notebook artifacts
+# ==========================
+working/
+*.ipynb
+
+# ==========================
+# Environment variables
+# ==========================
+.env
+
+# ==========================
+# Misc
+# ==========================
+*.zip
+*.rar
+*.7z
