@@ -51,10 +51,31 @@ class BraTSDataset(Dataset):
 
         for modality in self.modalities:
 
-            path = os.path.join(
-                patient_dir,
-                f"{modality}.nii.gz"
-            )
+            possible_paths = [
+
+                os.path.join(
+                    patient_dir,
+                    f"{modality}.nii.gz"
+                ),
+
+                os.path.join(
+                    patient_dir,
+                    f"{modality}.nii"
+                )
+            ]
+
+            path = None
+
+            for p in possible_paths:
+                if os.path.exists(p):
+                    path = p
+                    break
+
+            if path is None:
+                raise FileNotFoundError(
+                    f"{modality} not found "
+                    f"in {patient_dir}"
+                )
 
             image = self.load_nifti(path)
 
