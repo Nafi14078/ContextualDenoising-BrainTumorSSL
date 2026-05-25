@@ -20,8 +20,7 @@ patch_size:
 
 num_workers: 2
 
-pretrained_weights:
-  pretrained_weights/ssl_encoder.pth
+pretrained_weights: pretrained_weights/ssl_encoder.pth
 
 use_amp: true
 
