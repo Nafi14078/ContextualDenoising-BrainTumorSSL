@@ -18,7 +18,7 @@ patch_size:
   - 96
   - 96
 
-num_workers: 2
+num_workers: 4
 
 pretrained_weights: pretrained_weights/ssl_encoder.pth
 
