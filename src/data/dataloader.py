@@ -70,7 +70,8 @@ def build_ssl_dataloader(config):
         num_workers=config[
             "num_workers"
         ],
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers = True
     )
 
     val_loader = DataLoader(
@@ -82,7 +83,8 @@ def build_ssl_dataloader(config):
         num_workers=config[
             "num_workers"
         ],
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers = True
     )
 
     return train_loader, val_loader
