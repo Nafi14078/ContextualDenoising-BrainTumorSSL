@@ -8,7 +8,7 @@ log_dir: outputs/logs/
 device: cuda
 
 batch_size: 1
-epochs: 80
+epochs: 60
 
 learning_rate: 0.00005
 weight_decay: 0.00001
