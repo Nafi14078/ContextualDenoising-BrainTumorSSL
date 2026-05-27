@@ -31,3 +31,4 @@ mask_ratio: 0.15
 use_amp: true
 
 train_split: 0.9
+resume_checkpoint: /kaggle/input/datasets/ashfakazadnafi/brats2021-tar/ssl_checkpoint.pth
