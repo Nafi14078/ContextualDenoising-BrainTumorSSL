@@ -1,6 +1,6 @@
 seed: 42
 
-dataset_path: /kaggle/input/datasets/ashfakazadnafi/brats2021-tar/datasets/brats2021
+dataset_path: /kaggle/input/datasets/ashfakazadnafi/brats2021-tar/brats2021/datasets/brats2021
 
 save_dir: outputs/checkpoints/
 log_dir: outputs/logs/
