@@ -74,7 +74,7 @@ def evaluate():
     weights = torch.load(
 
         "pretrained_weights/"
-        "ssl_encoder.pth",
+        "ssl_checkpoint.pth",
 
         map_location=device
     )
