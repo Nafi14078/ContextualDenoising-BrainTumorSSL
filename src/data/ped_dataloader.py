@@ -129,7 +129,7 @@ def build_ped_dataloader(config):
 
             prefetch_factor=2,
 
-            drop_last=True
+            drop_last=False
         )
     )
 

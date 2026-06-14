@@ -1,15 +1,10 @@
 seed: 42
 
+# --------------------------------
+# Dataset
+# --------------------------------
+
 dataset_path: datasets/brats_ped/ASNR-MICCAI-BraTS2023-PED-Challenge-TrainingData
-
-save_dir: outputs/checkpoints/
-log_dir: outputs/logs/
-
-device: cuda
-
-# ------------------
-# Data
-# ------------------
 
 modalities:
   - t1n
@@ -25,34 +20,50 @@ num_classes: 4
 
 train_split: 0.8
 
-# ------------------
-# Training
-# ------------------
+# --------------------------------
+# Hardware
+# --------------------------------
 
-batch_size: 4
-
-epochs: 50
-
-learning_rate: 0.00005
-
-weight_decay: 0.00001
+device: cuda
 
 num_workers: 2
 
 use_amp: true
 
-# ------------------
+# --------------------------------
+# Training
+# --------------------------------
+
+batch_size: 4
+
+epochs: 60
+
+learning_rate: 0.00005
+
+weight_decay: 0.00001
+
+# --------------------------------
 # Transfer Learning
-# ------------------
+# --------------------------------
 
 pretrained_weights: pretrained_weights/ssl_encoder.pth
 
 freeze_encoder: false
 
-# ------------------
+# --------------------------------
+# Output Directories
+# --------------------------------
+
+save_dir: outputs/checkpoints/
+
+log_dir: outputs/logs/
+
+visualization_dir: outputs/visualizations/
+
+# --------------------------------
 # Checkpoints
-# ------------------
+# --------------------------------
 
-checkpoint_path: pretrained_weights/segmentation_checkpoint.pth
+checkpoint_path: outputs/checkpoints/segmentation_checkpoint.pth
 
-best_model_path: pretrained_weights/best_segmentation_model.pth
+best_model_path: outputs/checkpoints/best_segmentation_model.pth

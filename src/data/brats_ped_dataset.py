@@ -1,5 +1,4 @@
 import os
-import random
 
 import nibabel as nib
 import numpy as np
@@ -30,10 +29,59 @@ class BraTSPEDDataset(Dataset):
             num_slices // 2
         )
 
+        # --------------------------------
+        # Build slice-level index
+        # --------------------------------
+
+        self.samples = []
+
+        print(
+            "Building slice index..."
+        )
+
+        for patient_dir in self.patient_dirs:
+
+            patient_id = os.path.basename(
+                patient_dir
+            )
+
+            example_modality = os.path.join(
+
+                patient_dir,
+
+                f"{patient_id}-{self.modalities[0]}.nii.gz"
+            )
+
+            volume = self.load_nifti(
+                example_modality
+            )
+
+            depth = volume.shape[2]
+
+            for center_slice in range(
+
+                self.half,
+
+                depth - self.half
+            ):
+
+                self.samples.append(
+
+                    (
+                        patient_dir,
+                        center_slice
+                    )
+                )
+
+        print(
+            f"Total samples: "
+            f"{len(self.samples)}"
+        )
+
     def __len__(self):
 
         return len(
-            self.patient_dirs
+            self.samples
         )
 
     def load_nifti(
@@ -116,17 +164,18 @@ class BraTSPEDDataset(Dataset):
         idx
     ):
 
-        patient_dir = (
-            self.patient_dirs[idx]
+        patient_dir, center_slice = (
+
+            self.samples[idx]
         )
 
         patient_id = os.path.basename(
             patient_dir
         )
 
-        # --------------------------
+        # --------------------------------
         # Load modalities
-        # --------------------------
+        # --------------------------------
 
         modalities_data = []
 
@@ -152,13 +201,18 @@ class BraTSPEDDataset(Dataset):
             )
 
         volume = np.stack(
+
             modalities_data,
+
             axis=0
         )
 
-        # --------------------------
+        # volume shape:
+        # [4, H, W, D]
+
+        # --------------------------------
         # Load segmentation
-        # --------------------------
+        # --------------------------------
 
         seg_path = os.path.join(
 
@@ -173,38 +227,22 @@ class BraTSPEDDataset(Dataset):
             )
         )
 
-        # --------------------------
-        # Random center slice
-        # --------------------------
-
-        depth = volume.shape[1]
-
-        center_slice = random.randint(
-
-            self.half,
-
-            depth -
-            self.half -
-            1
-        )
-
-        # --------------------------
+        # --------------------------------
         # Build 20-channel input
-        # --------------------------
+        # --------------------------------
 
         stacked_slices = []
 
         for slice_idx in range(
 
-            center_slice -
-            self.half,
+            center_slice - self.half,
 
-            center_slice +
-            self.half +
-            1
+            center_slice + self.half + 1
         ):
 
             slice_data = volume[
+                :,
+                :,
                 :,
                 slice_idx
             ]
@@ -235,9 +273,9 @@ class BraTSPEDDataset(Dataset):
             axis=0
         )
 
-        # --------------------------
+        # --------------------------------
         # Target mask
-        # --------------------------
+        # --------------------------------
 
         target_mask = segmentation[
             :,

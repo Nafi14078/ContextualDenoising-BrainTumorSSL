@@ -1,15 +1,26 @@
-import torch
-
-from src.models.segmentation_model import (
-    SegmentationModel,
-    load_pretrained_encoder
+from src.data.ped_dataloader import (
+    build_ped_dataloader
 )
 
-model = SegmentationModel()
+import yaml
 
-model = load_pretrained_encoder(
-    model,
-    "pretrained_weights/ssl_encoder.pth"
+with open(
+    "configs/finetune.yaml",
+    "r"
+) as f:
+
+    config = yaml.safe_load(f)
+
+train_loader, val_loader = (
+    build_ped_dataloader(
+        config
+    )
 )
 
-print("Success")
+print(
+    len(train_loader.dataset)
+)
+
+print(
+    len(val_loader.dataset)
+)
