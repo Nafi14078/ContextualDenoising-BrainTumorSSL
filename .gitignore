@@ -53,7 +53,7 @@ outputs/
 checkpoints/
 
 # PyTorch checkpoints
-
+*.pth
 *.pt
 *.ckpt
 

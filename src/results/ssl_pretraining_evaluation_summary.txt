@@ -1,7 +1,0 @@
-Using device: cuda
-Valid patients(case): 100
-
-Results
-------------------------------
-Average PSNR: 29.2251
-Average SSIM: 0.9565

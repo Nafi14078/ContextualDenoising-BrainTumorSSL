@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────
+#  Fine-tuning Config  (BraTS-PED → Swin UNETR 2D)
+# ─────────────────────────────────────────────
+
+data:
+  bratsped_root:    "/kaggle/input/bratsped-preprocessed/train"
+  output_slices:    "/kaggle/input/bratsped-preprocessed/slices"
+  modalities:       ["t1", "t1ce", "t2", "flair"]
+  axis:             2
+  slice_skip:       10
+  min_tumor_ratio:  0.01         # for fine-tune, also keep tumor-containing slices
+  img_size:         240
+  patch_size:       192
+  val_split:        0.15
+  num_classes:      4            # 0=bg, 1=NCR/NET, 2=ED, 3=ET
+
+model:
+  pretrained_encoder: "/kaggle/input/pretrained-weights/pretrain_encoder.pth"
+  in_channels:      4
+  out_channels:     4
+  feature_size:     48           # Swin UNETR feature size
+  img_size:         192          # must match patch_size
+
+training:
+  # Phase 1 — decoder warmup (encoder frozen)
+  phase1_epochs:    30
+  phase1_lr:        1e-4
+  # Phase 2 — full fine-tuning (encoder unfrozen)
+  phase2_epochs:    70
+  phase2_lr:        5e-5
+
+  batch_size:       8            # 2D is much lighter than 3D
+  weight_decay:     1e-5
+  amp:              true
+  use_checkpoint:   true         # gradient checkpointing
+  save_every:       5
+  checkpoint_dir:   "/kaggle/working/checkpoints/finetune"
+  seed:             42
+
+loss:
+  dice_weight:      1.0
+  focal_weight:     1.0
+  focal_gamma:      2.0
+  focal_alpha:      0.25
+
+logging:
+  log_every:        50
