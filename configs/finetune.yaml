@@ -3,9 +3,7 @@ seed: 42
 # --------------------------------
 # Dataset
 # --------------------------------
-
-dataset_path: datasets/brats_ped/ASNR-MICCAI-BraTS2023-PED-Challenge-TrainingData
-
+dataset_path: /kaggle/input/datasets/ashfakazadnafi/brats2021-tar/ASNR-MICCAI-BraTS2023-PED-Challenge-TrainingData/ASNR-MICCAI-BraTS2023-PED-Challenge-TrainingData
 modalities:
   - t1n
   - t1c
@@ -54,16 +52,14 @@ freeze_encoder: false
 # Output Directories
 # --------------------------------
 
-save_dir: outputs/checkpoints/
-
-log_dir: outputs/logs/
-
-visualization_dir: outputs/visualizations/
+save_dir: /kaggle/working/outputs/checkpoints/
+log_dir: /kaggle/working/outputs/logs/
+visualization_dir: /kaggle/working/outputs/visualizations/
 
 # --------------------------------
 # Checkpoints
 # --------------------------------
 
-checkpoint_path: outputs/checkpoints/segmentation_checkpoint.pth
+checkpoint_path: /kaggle/working/outputs/checkpoints/segmentation_checkpoint.pth
 
-best_model_path: outputs/checkpoints/best_segmentation_model.pth
+best_model_path: /kaggle/working/outputs/checkpoints/best_segmentation_model.pth
