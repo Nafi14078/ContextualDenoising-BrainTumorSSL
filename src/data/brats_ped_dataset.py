@@ -45,11 +45,11 @@ class BraTSPEDDataset(Dataset):
                 patient_dir
             )
 
-            example_modality = os.path.join(
-
-                patient_dir,
-
-                f"{patient_id}-{self.modalities[0]}.nii.gz"
+            example_modality = (
+                self.get_file_path(
+                    patient_dir,
+                    f"{patient_id}-{self.modalities[0]}"
+                )
             )
 
             volume = self.load_nifti(
@@ -82,6 +82,41 @@ class BraTSPEDDataset(Dataset):
 
         return len(
             self.samples
+        )
+
+    # --------------------------------
+    # Supports BOTH .nii and .nii.gz
+    # --------------------------------
+
+    def get_file_path(
+        self,
+        patient_dir,
+        filename
+    ):
+
+        nii_path = os.path.join(
+            patient_dir,
+            filename + ".nii"
+        )
+
+        nii_gz_path = os.path.join(
+            patient_dir,
+            filename + ".nii.gz"
+        )
+
+        if os.path.exists(
+            nii_path
+        ):
+            return nii_path
+
+        if os.path.exists(
+            nii_gz_path
+        ):
+            return nii_gz_path
+
+        raise FileNotFoundError(
+            f"Cannot find file: "
+            f"{filename}"
         )
 
     def load_nifti(
@@ -181,11 +216,11 @@ class BraTSPEDDataset(Dataset):
 
         for modality in self.modalities:
 
-            path = os.path.join(
+            path = self.get_file_path(
 
                 patient_dir,
 
-                f"{patient_id}-{modality}.nii.gz"
+                f"{patient_id}-{modality}"
             )
 
             image = self.load_nifti(
@@ -214,11 +249,11 @@ class BraTSPEDDataset(Dataset):
         # Load segmentation
         # --------------------------------
 
-        seg_path = os.path.join(
+        seg_path = self.get_file_path(
 
             patient_dir,
 
-            f"{patient_id}-seg.nii.gz"
+            f"{patient_id}-seg"
         )
 
         segmentation = (
