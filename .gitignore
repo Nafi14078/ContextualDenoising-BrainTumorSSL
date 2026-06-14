@@ -49,11 +49,11 @@ raw.tar.gz
 # Model outputs
 # ==========================
 outputs/
-pretrained_weights/
+
 checkpoints/
 
 # PyTorch checkpoints
-*.pth
+
 *.pt
 *.ckpt
 
