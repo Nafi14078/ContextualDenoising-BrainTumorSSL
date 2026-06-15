@@ -79,7 +79,7 @@ def extract_slices(subject_dir: Path,
     """
     volumes = []
     for mod in modalities:
-        candidates = list(subject_dir.glob(f"*_{mod}.nii.gz"))
+        candidates = list(subject_dir.glob(f"*_{mod}.nii"))
         if not candidates:
             raise FileNotFoundError(
                 f"Missing modality '{mod}' in {subject_dir}")

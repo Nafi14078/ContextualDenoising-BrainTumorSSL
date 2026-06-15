@@ -67,7 +67,7 @@ def extract_subject(subject_dir: Path, modalities: list,
     """
     volumes = []
     for mod in modalities:
-        candidates = list(subject_dir.glob(f"*_{mod}.nii.gz"))
+        candidates = list(subject_dir.glob(f"*_{mod}.nii"))
         if not candidates:
             raise FileNotFoundError(f"Missing '{mod}' in {subject_dir}")
         vol = load_volume(candidates[0])
