@@ -77,42 +77,77 @@ def extract_slices(subject_dir: Path,
     Returns list of 2D arrays, each shaped (len(modalities), H, W).
     Only slices passing the brain-content threshold are returned.
     """
+
     volumes = []
+
     for mod in modalities:
-        candidates = list(subject_dir.glob(f"{mod}.nii"))
+
+        candidates = list(
+            subject_dir.glob(f"{mod}.nii")
+        )
+
         if not candidates:
+
             raise FileNotFoundError(
-                f"Missing modality '{mod}' in {subject_dir}")
-            try:
-                vol = load_volume(candidates[0])
-            except Exception as e:
-                raise FileNotFoundError(
-                    f"Corrupted file {candidates[0]} ({e})"
-                )
+                f"Missing modality '{mod}' in {subject_dir}"
+            )
 
-            vol = normalise_volume(vol)
-            volumes.append(vol) # each: (H, W, D)
+        try:
 
-    D = volumes[0].shape[axis]      # depth along chosen axis
+            vol = load_volume(
+                candidates[0]
+            )
+
+        except Exception as e:
+
+            raise FileNotFoundError(
+                f"Corrupted file {candidates[0]} ({e})"
+            )
+
+        vol = normalise_volume(
+            vol
+        )
+
+        volumes.append(
+            vol
+        )
+
+    D = volumes[0].shape[axis]
+
     slices_out = []
 
     for z in range(skip, D - skip):
-        # Extract 2D slice from each modality
-        if axis == 2:
-            stack = np.stack([v[:, :, z] for v in volumes], axis=0)  # (M,H,W)
-        elif axis == 1:
-            stack = np.stack([v[:, z, :] for v in volumes], axis=0)
-        else:
-            stack = np.stack([v[z, :, :] for v in volumes], axis=0)
 
-        # Quality filter: check first modality (T1)
+        if axis == 2:
+
+            stack = np.stack(
+                [v[:, :, z] for v in volumes],
+                axis=0
+            )
+
+        elif axis == 1:
+
+            stack = np.stack(
+                [v[:, z, :] for v in volumes],
+                axis=0
+            )
+
+        else:
+
+            stack = np.stack(
+                [v[z, :, :] for v in volumes],
+                axis=0
+            )
+
         if brain_ratio(stack[0]) < min_brain:
+
             continue
 
-        slices_out.append(stack)
+        slices_out.append(
+            stack
+        )
 
-    return slices_out   # list of (M, H, W) float32 arrays
-
+    return slices_out
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -144,12 +179,14 @@ def main(args):
                 "axis": axis, "skip": skip, "min_brain": min_brain}
 
     total_train, total_val = 0, 0
+    corrupted_count = 0
 
     for subj in tqdm(subjects, desc="Processing subjects"):
         split = "val" if subj.name in val_set else "train"
         try:
             slices = extract_slices(subj, modalities, skip, min_brain, axis)
         except FileNotFoundError as e:
+            corrupted_count += 1
             print(f"  [WARN] {e} — skipping")
             continue
 
@@ -169,6 +206,7 @@ def main(args):
     print(f"\n✓ Done")
     print(f"  Train slices : {total_train}")
     print(f"  Val slices   : {total_val}")
+    print(f"  Corrupted / Skipped subjects : {corrupted_count}")
     print(f"  Saved to     : {out_dir}")
 
 
