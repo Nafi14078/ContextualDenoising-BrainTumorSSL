@@ -83,9 +83,15 @@ def extract_slices(subject_dir: Path,
         if not candidates:
             raise FileNotFoundError(
                 f"Missing modality '{mod}' in {subject_dir}")
-        vol = load_volume(candidates[0])
-        vol = normalise_volume(vol)
-        volumes.append(vol)         # each: (H, W, D)
+            try:
+                vol = load_volume(candidates[0])
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Corrupted file {candidates[0]} ({e})"
+                )
+
+            vol = normalise_volume(vol)
+            volumes.append(vol) # each: (H, W, D)
 
     D = volumes[0].shape[axis]      # depth along chosen axis
     slices_out = []
