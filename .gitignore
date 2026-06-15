@@ -71,7 +71,7 @@ temp/
 # Kaggle / notebook artifacts
 # ==========================
 working/
-*.ipynb
+
 
 # ==========================
 # Environment variables
