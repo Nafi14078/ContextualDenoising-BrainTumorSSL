@@ -82,9 +82,8 @@ def extract_slices(subject_dir: Path,
 
     for mod in modalities:
 
-        candidates = list(
-            subject_dir.glob(f"{mod}.nii")
-        )
+        candidates = list(subject_dir.glob(f"{mod}.nii.gz")) or \
+                     list(subject_dir.glob(f"{mod}.nii"))
 
         if not candidates:
 
