@@ -276,12 +276,12 @@ def main(cfg_path: str):
     ).to(device)
 
     criterion  = PretrainLoss(lambda_consistency=1.0)
-    optimizer  = torch.optim.Adam(
+    optimizer = torch.optim.Adam(
         list(model.parameters()) + list(sts.parameters()),
-        lr           = cfg["training"]["lr"],
-        betas        = (cfg["training"]["beta1"],
-                        cfg["training"]["beta2"]),
-        weight_decay = cfg["training"]["weight_decay"]
+        lr=float(cfg["training"]["lr"]),
+        betas=(float(cfg["training"]["beta1"]),
+               float(cfg["training"]["beta2"])),
+        weight_decay=float(cfg["training"]["weight_decay"])
     )
     scheduler  = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=cfg["training"]["lr_decay_step"], gamma=0.5)

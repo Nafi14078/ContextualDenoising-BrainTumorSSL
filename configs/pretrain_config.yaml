@@ -7,8 +7,8 @@ data:
   output_slices:    "/kaggle/input/brats2021-preprocessed/slices"
   modalities:       ["t1", "t1ce", "t2", "flair"]
   axis:             2            # 2 = axial
-  slice_skip:       10           # skip first & last N slices (mostly background)
-  min_brain_ratio:  0.05         # discard slices with <5% brain voxels
+  slice_skip:       25           # skip first & last N slices (mostly background)
+  min_brain_ratio:  0.08         # discard slices with <8% brain voxels
   img_size:         240          # slices are 240×240 in BraTS2021
   patch_size:       192          # random crop size during training
   val_split:        0.1
@@ -30,12 +30,12 @@ model:
 training:
   epochs:           30
   batch_size:       4            # 4 slice-windows per step
-  lr:               1e-4
+  lr:               0.0001
   lr_decay_step:    10           # halve LR every N epochs
-  weight_decay:     5e-4
+  weight_decay:     0.0005
   beta1:            0.5
   beta2:            0.9
-  delta:            1e-4         # convergence threshold for consistency loss
+  delta:            0.0001         # convergence threshold for consistency loss
   amp:              true         # mixed precision — essential on Kaggle T4
   save_every:       5            # checkpoint every N epochs
   checkpoint_dir:   "/kaggle/working/checkpoints/pretrain"
