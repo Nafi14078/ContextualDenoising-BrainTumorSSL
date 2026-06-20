@@ -8,12 +8,14 @@ data:
   modalities:       ["t1", "t1ce", "t2", "flair"]
   axis:             2            # 2 = axial
   slice_skip:       25           # skip first & last N slices (mostly background)
+                                  # — matches actual --skip 25 used locally
   min_brain_ratio:  0.08         # discard slices with <8% brain voxels
+                                  # — matches actual --min_brain 0.08 used locally
   img_size:         240          # slices are 240×240 in BraTS2021
   patch_size:       192          # random crop size during training
   val_split:        0.1
-  max_train_subjects: 478         # → ~50,000 train slices (104.5 avg slices/subject)
-  max_val_subjects:   53          # → ~5,554 val slices (proportional 90/10 split)
+  max_train_subjects: 200          # ~20,900 slices, ~48 min/epoch (vs 1.9hr at 478)
+  max_val_subjects:   25           # ~2,600 slices, proportional split
 
 sts:
   N:                7            # slice window: central ± 3
