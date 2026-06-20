@@ -1,14 +1,15 @@
 """
 pretraining/train_pretrain.py
 ────────────────────────────────────────────────────────────────────────────────
-Recurrent self-supervised pretraining loop (STS-UVD on BraTS2021 slices).
+Self-supervised pretraining loop (STS-UVD on BraTS2021 slices).
 
 Key behaviours:
-  • Epoch 0: reference = noisy central slice
-  • Each subsequent epoch: reference ← previous epoch's denoised output
+  • L1 reference is the noisy central slice every epoch (no cross-epoch
+    recurrent caching — see note below for why this was removed)
   • Training stops when slice-consistency loss L2 converges (< delta)
     OR max_epochs is reached
   • Encoder weights saved after training for transfer to Swin UNETR
+  • Resumable via --resume <checkpoint.pth>
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -65,15 +66,6 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
                           checkpoint predates scheduler saving (older
                           checkpoints fall back to step-count fast-forward
                           in main())
-
-    NOTE on the recurrent reference cache: ReferenceCache lives entirely
-    in memory and is NOT saved to disk (it would be enormous — one image
-    per training sample). On resume, the cache starts cold again, so the
-    first resumed epoch falls back to using the noisy central slice as
-    the L1 reference instead of the previous epoch's denoised output.
-    This is a known, accepted tradeoff — the recurrent refinement simply
-    re-establishes itself within the first resumed epoch and is not a
-    correctness bug.
     """
     print(f"\n[Resume] Loading checkpoint from {path}")
     ckpt = torch.load(path, map_location=device)
@@ -106,78 +98,28 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
               f"best_psnr will reset and update on next validation.")
     else:
         print(f"  Best PSNR so far: {best_psnr:.2f} dB")
-    print(f"  [WARN] Reference cache restarts cold on resume — "
-          f"recurrent refinement re-establishes within 1 epoch.\n")
+    print()
 
     return start_epoch, best_psnr, scheduler_state
 
 
-# ── Reference Cache ───────────────────────────────────────────────────────────
-
-class ReferenceCache:
-    """
-    Stores previous-epoch denoised outputs keyed by STABLE dataset index
-    (the (subject, central_slice) identity — see dataset.py's "index"
-    field), not by batch/step position.
-
-    Why this matters: the train DataLoader shuffles every epoch. A naive
-    cache keyed by step number (epoch * len(loader) + step) would mix up
-    completely different physical slices across epochs — e.g. "step 437"
-    in epoch 1 is almost certainly a different slice than "step 437" in
-    epoch 2. That breaks the recurrent reference mechanism described in
-    the paper (Section 4): "update the reference frame using the output
-    denoised frame from the previous epoch" only makes sense if you're
-    talking about the SAME frame each time.
-
-    Keying by dataset index fixes this — index 8471 always refers to the
-    exact same (subject, slice) pair, every epoch, regardless of shuffle
-    order, so the cache correctly tracks "this slice's own previous
-    denoised output."
-
-    On epoch 0 (or whenever a given index hasn't been seen yet), falls
-    back to the noisy input — matching the paper's cold-start behaviour.
-    Lives on CPU to avoid GPU OOM with large caches.
-    """
-
-    def __init__(self):
-        self._cache = {}
-
-    def get_batch(self,
-                  indices:        torch.Tensor,
-                  fallback_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            indices        : (B,) tensor/list of stable dataset indices
-            fallback_batch  : (B, C, H, W) — used for any index not yet
-                              cached (cold start)
-        Returns:
-            (B, C, H, W) — cached reference per-sample, or fallback
-        """
-        out = []
-        for i, idx in enumerate(indices):
-            idx = int(idx)
-            if idx in self._cache:
-                out.append(self._cache[idx].to(fallback_batch.device))
-            else:
-                out.append(fallback_batch[i].clone())
-        return torch.stack(out, dim=0)
-
-    def update_batch(self,
-                     indices:  torch.Tensor,
-                     denoised: torch.Tensor):
-        """
-        Args:
-            indices  : (B,) tensor/list of stable dataset indices
-            denoised : (B, C, H, W) — this epoch's denoised output,
-                       becomes next epoch's reference for these exact
-                       samples
-        """
-        for i, idx in enumerate(indices):
-            idx = int(idx)
-            self._cache[idx] = denoised[i].detach().cpu()
-
-    def clear(self):
-        self._cache.clear()
+# NOTE: The cross-epoch ReferenceCache mechanism described in earlier
+# versions of this file has been REMOVED. It stored one tensor per
+# unique training sample (47,115 of them at 576 KB each = ~26 GB),
+# growing unboundedly through an epoch with no eviction — causing the
+# RAM exhaustion seen on Kaggle. It also had a deeper correctness issue:
+# since train uses random crop augmentation every epoch, a cached
+# "previous epoch's denoised output" referred to a DIFFERENT spatial
+# crop than the current epoch's crop, so the comparison wasn't even
+# spatially aligned. The paper's recurrent reference design (Section 4)
+# was built for a single short video of a few hundred/thousand frames,
+# not a large multi-subject dataset with per-epoch random cropping —
+# it doesn't transfer cleanly at this scale.
+#
+# Reference for the L1 loss is now simply the noisy central slice every
+# epoch (matching what epoch 0 already did). The actual unsupervised
+# denoising signal still comes from the STS blind-spot kernel (S) and
+# temporal weighting (T), which are unaffected by this change.
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
@@ -188,7 +130,6 @@ def train_one_epoch(model:       UNetDenoiser,
                     criterion:   PretrainLoss,
                     optimizer,
                     scaler:      GradScaler,
-                    ref_cache:   ReferenceCache,
                     epoch:       int,
                     max_epochs:  int,
                     device,
@@ -208,13 +149,11 @@ def train_one_epoch(model:       UNetDenoiser,
         noisy   = batch["noisy"].to(device)    # (B, N, 4, H, W)
         clean   = batch["clean"].to(device)    # (B, N, 4, H, W)
         C_idx   = batch["central"][0].item()   # scalar (same for all in batch)
-        indices = batch["index"]               # (B,) — STABLE per-sample IDs
 
-        # Reference for L1 loss — recurrent, keyed by stable sample identity
-        # so it correctly tracks "this exact slice's previous-epoch output"
-        # even though the DataLoader shuffles order every epoch.
+        # Reference for L1 loss — the noisy central slice itself.
+        # (No cross-epoch recurrent caching — see note above class removal.)
         noisy_central = noisy[:, C_idx]       # (B, 4, H, W)
-        reference     = ref_cache.get_batch(indices, noisy_central)
+        reference     = noisy_central
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -241,9 +180,6 @@ def train_one_epoch(model:       UNetDenoiser,
             list(model.parameters()) + list(sts.parameters()), 1.0)
         scaler.step(optimizer)
         scaler.update()
-
-        # Update reference cache for next epoch — keyed by stable index
-        ref_cache.update_batch(indices, denoised_central)
 
         for k, v in loss_dict.items():
             running[k] += v.item()
@@ -384,7 +320,6 @@ def main(cfg_path: str, resume_path: str = None):
         weight_decay = float(cfg["training"]["weight_decay"])
     )
     scaler     = GradScaler(enabled=cfg["training"]["amp"])
-    ref_cache  = ReferenceCache()
 
     max_epochs = cfg["training"]["epochs"]
     delta      = cfg["training"]["delta"]
@@ -434,7 +369,7 @@ def main(cfg_path: str, resume_path: str = None):
 
         train_metrics = train_one_epoch(
             model, sts, train_loader, criterion, optimizer,
-            scaler, ref_cache, epoch, max_epochs, device,
+            scaler, epoch, max_epochs, device,
             cfg["logging"]["log_every"], cfg["training"]["amp"])
 
         val_metrics = validate(
