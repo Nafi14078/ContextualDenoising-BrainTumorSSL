@@ -9,9 +9,6 @@ Key behaviours:
   • Training stops when slice-consistency loss L2 converges (< delta)
     OR max_epochs is reached
   • Encoder weights saved after training for transfer to Swin UNETR
-  • Live tqdm progress bar shows samples processed / total / % / loss
-  • _denoise_full_window reuses the already-computed `sampled` tensor —
-    no redundant feature extraction or STS sampling (major speed fix)
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -57,12 +54,62 @@ def save_checkpoint(state: dict, path: Path):
     print(f"  ✓ Checkpoint saved → {path}")
 
 
-def load_checkpoint(path: Path, model, optimizer, scaler):
-    ckpt = torch.load(path, map_location="cpu")
+def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
+    """
+    Load a checkpoint and restore full training state.
+
+    Returns:
+        start_epoch : epoch to resume FROM (i.e. next epoch to run)
+        best_psnr   : best validation PSNR seen so far (or -1.0 if unknown)
+        scheduler_state : state dict for the LR scheduler, or None if the
+                          checkpoint predates scheduler saving (older
+                          checkpoints fall back to step-count fast-forward
+                          in main())
+
+    NOTE on the recurrent reference cache: ReferenceCache lives entirely
+    in memory and is NOT saved to disk (it would be enormous — one image
+    per training sample). On resume, the cache starts cold again, so the
+    first resumed epoch falls back to using the noisy central slice as
+    the L1 reference instead of the previous epoch's denoised output.
+    This is a known, accepted tradeoff — the recurrent refinement simply
+    re-establishes itself within the first resumed epoch and is not a
+    correctness bug.
+    """
+    print(f"\n[Resume] Loading checkpoint from {path}")
+    ckpt = torch.load(path, map_location=device)
+
     model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scaler.load_state_dict(ckpt["scaler"])
-    return ckpt["epoch"] + 1, ckpt.get("references", None)
+
+    if "sts" in ckpt:
+        sts.load_state_dict(ckpt["sts"])
+    else:
+        print("  [WARN] Checkpoint has no 'sts' state — STS module "
+              "kernels will use freshly initialised state.")
+
+    if "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    else:
+        print("  [WARN] Checkpoint has no 'optimizer' state — "
+              "optimizer momentum/state will restart fresh.")
+
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+
+    start_epoch = ckpt["epoch"] + 1
+    best_psnr   = ckpt.get("psnr", -1.0)
+    scheduler_state = ckpt.get("scheduler", None)
+
+    print(f"  ✓ Resumed from epoch {ckpt['epoch'] + 1} "
+          f"→ continuing at epoch {start_epoch + 1}")
+    if best_psnr < 0:
+        print(f"  [WARN] No 'psnr' recorded in this checkpoint — "
+              f"best_psnr will reset and update on next validation.")
+    else:
+        print(f"  Best PSNR so far: {best_psnr:.2f} dB")
+    print(f"  [WARN] Reference cache restarts cold on resume — "
+          f"recurrent refinement re-establishes within 1 epoch.\n")
+
+    return start_epoch, best_psnr, scheduler_state
 
 
 # ── Reference Cache ───────────────────────────────────────────────────────────
@@ -247,7 +294,7 @@ def validate(model:    UNetDenoiser,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(cfg_path: str):
+def main(cfg_path: str, resume_path: str = None):
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -257,11 +304,13 @@ def main(cfg_path: str):
 
     # ── Data ──
     train_loader, val_loader = get_pretrain_loaders(
-        slices_dir  = cfg["data"]["output_slices"],
-        N           = cfg["sts"]["N"],
-        patch_size  = cfg["data"]["patch_size"],
-        batch_size  = cfg["training"]["batch_size"],
-        num_workers = 2
+        slices_dir          = cfg["data"]["output_slices"],
+        N                   = cfg["sts"]["N"],
+        patch_size          = cfg["data"]["patch_size"],
+        batch_size          = cfg["training"]["batch_size"],
+        num_workers         = 2,
+        max_train_subjects  = cfg["data"].get("max_train_subjects", None),
+        max_val_subjects    = cfg["data"].get("max_val_subjects", None)
     )
 
     # ── Models ──
@@ -291,19 +340,52 @@ def main(cfg_path: str):
                         float(cfg["training"]["beta2"])),
         weight_decay = float(cfg["training"]["weight_decay"])
     )
-    scheduler  = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=cfg["training"]["lr_decay_step"], gamma=0.5)
     scaler     = GradScaler(enabled=cfg["training"]["amp"])
     ref_cache  = ReferenceCache()
 
     max_epochs = cfg["training"]["epochs"]
     delta      = cfg["training"]["delta"]
     ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
-    best_psnr  = -1.0
-    prev_l2    = float("inf")
+
+    # ── Resume state (defaults for a fresh run) ──
+    start_epoch     = 0
+    best_psnr       = -1.0
+    scheduler_state = None
+
+    if resume_path:
+        resume_path = Path(resume_path)
+        if resume_path.exists():
+            start_epoch, best_psnr, scheduler_state = load_checkpoint(
+                resume_path, model, sts, optimizer, scaler, device)
+        else:
+            print(f"[WARN] --resume path not found: {resume_path}")
+            print("       Starting fresh from epoch 0 instead.")
+
+    # ── Scheduler — created fresh, then restored or fast-forwarded ──
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=cfg["training"]["lr_decay_step"], gamma=0.5)
+
+    if resume_path and start_epoch > 0:
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+        else:
+            # Older checkpoint without saved scheduler state — fast-forward
+            # by replaying the same number of .step() calls. StepLR's
+            # behaviour depends only on call count, so this is exact.
+            print(f"  [Resume] No scheduler state found — fast-forwarding "
+                  f"{start_epoch} scheduler steps to match.")
+            for _ in range(start_epoch):
+                scheduler.step()
+
+    prev_l2 = float("inf")
+
+    if start_epoch >= max_epochs:
+        print(f"[WARN] Resumed epoch ({start_epoch}) >= max_epochs "
+              f"({max_epochs}). Nothing to train — exiting.")
+        return
 
     # ── Training loop ──
-    for epoch in range(max_epochs):
+    for epoch in range(start_epoch, max_epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{max_epochs}")
 
@@ -334,6 +416,7 @@ def main(cfg_path: str):
                 "sts":       sts.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler":    scaler.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "psnr":      best_psnr,
             }, ckpt_dir / "best_model.pth")
 
@@ -345,6 +428,8 @@ def main(cfg_path: str):
                 "sts":       sts.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler":    scaler.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "psnr":      best_psnr,
             }, ckpt_dir / f"epoch_{epoch+1:03d}.pth")
 
         # Convergence check on L2 (paper stops when L2 < delta)
@@ -366,5 +451,9 @@ def main(cfg_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="../configs/pretrain_config.yaml")
+    parser.add_argument("--resume", default=None,
+                        help="Path to a checkpoint (.pth) to resume from. "
+                             "Restores model, sts, optimizer, scaler, "
+                             "scheduler, epoch, and best_psnr.")
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.resume)

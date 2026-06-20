@@ -40,18 +40,26 @@ class BraTS2021SliceWindowDataset(Dataset):
     """
 
     def __init__(self,
-                 slices_dir:  str,
-                 split:       str   = "train",
-                 N:           int   = 7,
-                 patch_size:  int   = 192,
-                 augment:     bool  = True):
+                 slices_dir:   str,
+                 split:        str   = "train",
+                 N:            int   = 7,
+                 patch_size:   int   = 192,
+                 augment:      bool  = True,
+                 max_subjects: int   = None,
+                 subset_seed:  int   = 42):
         """
         Args:
-            slices_dir : root dir produced by preprocess_brats2021.py
-            split      : "train" or "val"
-            N          : number of slices in each window (must be odd)
-            patch_size : random crop size
-            augment    : apply augmentation (train only)
+            slices_dir   : root dir produced by preprocess_brats2021.py
+            split        : "train" or "val"
+            N            : number of slices in each window (must be odd)
+            patch_size   : random crop size
+            augment      : apply augmentation (train only)
+            max_subjects : if set, randomly keep only this many subjects.
+                           Speeds up training dramatically since SSL
+                           pretraining needs diversity, not volume —
+                           150-200 subjects is typically plenty.
+            subset_seed  : fixed seed so the same subjects are kept
+                           across runs (reproducible subsampling)
         """
         assert N % 2 == 1, "N must be odd so there is a clear central slice"
         self.slices_dir = Path(slices_dir) / split
@@ -69,13 +77,114 @@ class BraTS2021SliceWindowDataset(Dataset):
 
         # Build subject → sorted slice list mapping
         self.subject_slices = self._group_by_subject(all_fnames)
+        full_subject_slices  = self.subject_slices   # keep reference for verification
+
+        # ── Optional subject-level subsampling for faster pretraining ──
+        self.subsample_report = None
+        if max_subjects is not None and len(self.subject_slices) > max_subjects:
+            all_ids = sorted(self.subject_slices.keys())
+            rng     = random.Random(subset_seed)
+            kept_ids = set(rng.sample(all_ids, max_subjects))
+
+            subsampled_slices = {
+                k: v for k, v in full_subject_slices.items() if k in kept_ids
+            }
+
+            # ── Verify the subsample is distributionally representative ──
+            self.subsample_report = self._verify_subsample(
+                full_subject_slices, subsampled_slices, split)
+
+            self.subject_slices = subsampled_slices
 
         # Build flat index: list of (subject_id, central_slice_local_idx)
         self.index = self._build_index()
 
         print(f"[Dataset] {split}: "
               f"{len(self.index)} windows from "
-              f"{len(self.subject_slices)} subjects")
+              f"{len(self.subject_slices)} subjects"
+              + (f" (subsampled from {len(all_fnames)} total slices)"
+                 if max_subjects is not None else ""))
+
+    # ── subsample verification ──────────────────────────────────────────────
+
+    def _verify_subsample(self,
+                          full_slices: dict,
+                          subset_slices: dict,
+                          split: str) -> dict:
+        """
+        Compares the slices-per-subject distribution of the full dataset
+        vs. the subsampled subset, to check whether random subsampling
+        accidentally introduced a skew (e.g. toward subjects with more
+        or fewer slices, which often correlates with brain/tumor size).
+
+        Prints a summary table and, if scipy is available, runs a
+        two-sample Kolmogorov-Smirnov test — a standard way to check
+        whether two samples could plausibly come from the same
+        underlying distribution. A high p-value (> 0.05) means there's
+        no statistically significant evidence the subset distribution
+        differs from the full dataset's.
+
+        Returns a dict report (also useful to log/cite in a thesis
+        methodology section instead of just asserting "randomly sampled").
+        """
+        full_counts   = np.array([len(v) for v in full_slices.values()])
+        subset_counts = np.array([len(v) for v in subset_slices.values()])
+
+        report = {
+            "split":              split,
+            "full_n_subjects":    len(full_counts),
+            "subset_n_subjects":  len(subset_counts),
+            "full_mean_slices":   float(full_counts.mean()),
+            "subset_mean_slices": float(subset_counts.mean()),
+            "full_std_slices":    float(full_counts.std()),
+            "subset_std_slices":  float(subset_counts.std()),
+            "full_min_slices":    int(full_counts.min()),
+            "subset_min_slices":  int(subset_counts.min()),
+            "full_max_slices":    int(full_counts.max()),
+            "subset_max_slices":  int(subset_counts.max()),
+        }
+
+        print(f"\n[Subsample Verification — {split}]")
+        print(f"  {'Metric':<22} {'Full':>12} {'Subset':>12}")
+        print(f"  {'-'*22} {'-'*12} {'-'*12}")
+        print(f"  {'N subjects':<22} {report['full_n_subjects']:>12} "
+              f"{report['subset_n_subjects']:>12}")
+        print(f"  {'Mean slices/subj':<22} {report['full_mean_slices']:>12.1f} "
+              f"{report['subset_mean_slices']:>12.1f}")
+        print(f"  {'Std slices/subj':<22} {report['full_std_slices']:>12.1f} "
+              f"{report['subset_std_slices']:>12.1f}")
+        print(f"  {'Min slices/subj':<22} {report['full_min_slices']:>12} "
+              f"{report['subset_min_slices']:>12}")
+        print(f"  {'Max slices/subj':<22} {report['full_max_slices']:>12} "
+              f"{report['subset_max_slices']:>12}")
+
+        try:
+            from scipy.stats import ks_2samp
+            ks_stat, ks_pvalue = ks_2samp(full_counts, subset_counts)
+            report["ks_statistic"] = float(ks_stat)
+            report["ks_pvalue"]    = float(ks_pvalue)
+
+            verdict = ("representative (no significant difference)"
+                      if ks_pvalue > 0.05
+                      else "POTENTIALLY SKEWED (distributions differ)")
+
+            print(f"  {'KS statistic':<22} {ks_stat:>12.4f}")
+            print(f"  {'KS p-value':<22} {ks_pvalue:>12.4f}")
+            print(f"  → Verdict: {verdict}")
+
+            if ks_pvalue <= 0.05:
+                print(f"  ⚠️  WARNING: subsample distribution differs "
+                      f"significantly from full dataset.")
+                print(f"     Consider increasing max_subjects or trying "
+                      f"a different subset_seed.")
+        except ImportError:
+            print(f"  [scipy not installed — skipping KS test. "
+                  f"pip install scipy for full statistical verification]")
+            report["ks_statistic"] = None
+            report["ks_pvalue"]    = None
+
+        print()
+        return report
 
     # ── private ──────────────────────────────────────────────────────────────
 
@@ -199,20 +308,31 @@ class BraTS2021SliceWindowDataset(Dataset):
         }
 
 
-def get_pretrain_loaders(slices_dir: str,
-                         N:          int = 7,
-                         patch_size: int = 192,
-                         batch_size: int = 4,
-                         num_workers: int = 2):
-    """Convenience function returning (train_loader, val_loader)."""
+def get_pretrain_loaders(slices_dir:        str,
+                         N:                 int = 7,
+                         patch_size:        int = 192,
+                         batch_size:        int = 4,
+                         num_workers:       int = 2,
+                         max_train_subjects: int = None,
+                         max_val_subjects:   int = None):
+    """
+    Convenience function returning (train_loader, val_loader).
+
+    max_train_subjects / max_val_subjects : optional subject-count caps
+    for faster pretraining. SSL pretraining needs diversity, not volume —
+    150-200 train subjects / 20-25 val subjects is typically plenty to
+    learn strong generic denoising features that transfer well.
+    """
     from torch.utils.data import DataLoader
 
     train_ds = BraTS2021SliceWindowDataset(
         slices_dir, split="train", N=N,
-        patch_size=patch_size, augment=True)
+        patch_size=patch_size, augment=True,
+        max_subjects=max_train_subjects)
     val_ds   = BraTS2021SliceWindowDataset(
         slices_dir, split="val", N=N,
-        patch_size=patch_size, augment=False)
+        patch_size=patch_size, augment=False,
+        max_subjects=max_val_subjects)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,

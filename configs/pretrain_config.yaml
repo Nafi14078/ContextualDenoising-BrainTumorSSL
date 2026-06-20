@@ -12,6 +12,8 @@ data:
   img_size:         240          # slices are 240×240 in BraTS2021
   patch_size:       192          # random crop size during training
   val_split:        0.1
+  max_train_subjects: 478         # → ~50,000 train slices (104.5 avg slices/subject)
+  max_val_subjects:   53          # → ~5,554 val slices (proportional 90/10 split)
 
 sts:
   N:                7            # slice window: central ± 3
@@ -35,11 +37,11 @@ training:
   weight_decay:     0.0005
   beta1:            0.5
   beta2:            0.9
-  delta:            0.0001         # convergence threshold for consistency loss
+  delta:            0.0001       # convergence threshold for consistency loss
   amp:              true         # mixed precision — essential on Kaggle T4
   save_every:       5            # checkpoint every N epochs
   checkpoint_dir:   "/kaggle/working/checkpoints/pretrain"
   seed:             42
 
 logging:
-  log_every:        10           # steps
+  log_every:        50           # steps
