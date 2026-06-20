@@ -304,7 +304,16 @@ class BraTS2021SliceWindowDataset(Dataset):
         return {
             "noisy":    noisy,    # (N, 4, P, P) — model input
             "clean":    clean,    # (N, 4, P, P) — reconstruction target
-            "central":  self.half # index of central slice in the window
+            "central":  self.half,# index of central slice in the window
+            "index":    idx       # STABLE identity of this (subject, slice)
+                                   # pair — same value across every epoch,
+                                   # regardless of DataLoader shuffling.
+                                   # Used by ReferenceCache so the recurrent
+                                   # L1 reference correctly tracks "this
+                                   # exact slice's previous-epoch denoised
+                                   # output", matching the paper's design
+                                   # (Section 4), instead of "whatever
+                                   # happened to be at this batch position."
         }
 
 

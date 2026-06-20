@@ -116,24 +116,65 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
 
 class ReferenceCache:
     """
-    Stores previous-epoch denoised outputs keyed by dataset index.
-    On epoch 0, returns the noisy input as the reference (cold start).
-    Lives on CPU to avoid GPU OOM.
+    Stores previous-epoch denoised outputs keyed by STABLE dataset index
+    (the (subject, central_slice) identity — see dataset.py's "index"
+    field), not by batch/step position.
+
+    Why this matters: the train DataLoader shuffles every epoch. A naive
+    cache keyed by step number (epoch * len(loader) + step) would mix up
+    completely different physical slices across epochs — e.g. "step 437"
+    in epoch 1 is almost certainly a different slice than "step 437" in
+    epoch 2. That breaks the recurrent reference mechanism described in
+    the paper (Section 4): "update the reference frame using the output
+    denoised frame from the previous epoch" only makes sense if you're
+    talking about the SAME frame each time.
+
+    Keying by dataset index fixes this — index 8471 always refers to the
+    exact same (subject, slice) pair, every epoch, regardless of shuffle
+    order, so the cache correctly tracks "this slice's own previous
+    denoised output."
+
+    On epoch 0 (or whenever a given index hasn't been seen yet), falls
+    back to the noisy input — matching the paper's cold-start behaviour.
+    Lives on CPU to avoid GPU OOM with large caches.
     """
 
     def __init__(self):
         self._cache = {}
 
-    def get(self, idx: int,
-            noisy_central: torch.Tensor) -> torch.Tensor:
-        """Return cached reference or noisy_central if not yet cached."""
-        if idx in self._cache:
-            return self._cache[idx].to(noisy_central.device)
-        return noisy_central.clone()
+    def get_batch(self,
+                  indices:        torch.Tensor,
+                  fallback_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            indices        : (B,) tensor/list of stable dataset indices
+            fallback_batch  : (B, C, H, W) — used for any index not yet
+                              cached (cold start)
+        Returns:
+            (B, C, H, W) — cached reference per-sample, or fallback
+        """
+        out = []
+        for i, idx in enumerate(indices):
+            idx = int(idx)
+            if idx in self._cache:
+                out.append(self._cache[idx].to(fallback_batch.device))
+            else:
+                out.append(fallback_batch[i].clone())
+        return torch.stack(out, dim=0)
 
-    def update(self, idx: int, denoised: torch.Tensor):
-        """Store denoised output (detached, on CPU)."""
-        self._cache[idx] = denoised.detach().cpu()
+    def update_batch(self,
+                     indices:  torch.Tensor,
+                     denoised: torch.Tensor):
+        """
+        Args:
+            indices  : (B,) tensor/list of stable dataset indices
+            denoised : (B, C, H, W) — this epoch's denoised output,
+                       becomes next epoch's reference for these exact
+                       samples
+        """
+        for i, idx in enumerate(indices):
+            idx = int(idx)
+            self._cache[idx] = denoised[i].detach().cpu()
 
     def clear(self):
         self._cache.clear()
@@ -164,14 +205,16 @@ def train_one_epoch(model:       UNetDenoiser,
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs}", unit="batch")
 
     for step, batch in enumerate(pbar):
-        noisy  = batch["noisy"].to(device)    # (B, N, 4, H, W)
-        clean  = batch["clean"].to(device)    # (B, N, 4, H, W)
-        C_idx  = batch["central"][0].item()   # scalar (same for all in batch)
+        noisy   = batch["noisy"].to(device)    # (B, N, 4, H, W)
+        clean   = batch["clean"].to(device)    # (B, N, 4, H, W)
+        C_idx   = batch["central"][0].item()   # scalar (same for all in batch)
+        indices = batch["index"]               # (B,) — STABLE per-sample IDs
 
-        # Reference for L1 loss (recurrent — from previous epoch)
+        # Reference for L1 loss — recurrent, keyed by stable sample identity
+        # so it correctly tracks "this exact slice's previous-epoch output"
+        # even though the DataLoader shuffles order every epoch.
         noisy_central = noisy[:, C_idx]       # (B, 4, H, W)
-        ref_key       = epoch * len(loader) + step  # unique per step
-        reference     = ref_cache.get(ref_key, noisy_central)
+        reference     = ref_cache.get_batch(indices, noisy_central)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -199,8 +242,8 @@ def train_one_epoch(model:       UNetDenoiser,
         scaler.step(optimizer)
         scaler.update()
 
-        # Update reference cache for next epoch
-        ref_cache.update(ref_key, denoised_central)
+        # Update reference cache for next epoch — keyed by stable index
+        ref_cache.update_batch(indices, denoised_central)
 
         for k, v in loss_dict.items():
             running[k] += v.item()
