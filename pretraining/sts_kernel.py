@@ -12,7 +12,7 @@ Paper → MRI mapping:
 
 Two modules:
   WeightedTemporalKernel (𝒯) : slice-distance-based weighting
-  WeightedSpatialKernel  (𝒮) : blind-spot pixel replacement
+  WeightedSpatialKernel  (𝒮) : blind-spot pixel replacement (vectorized)
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -190,6 +190,13 @@ class WeightedSpatialKernel(nn.Module):
 
     This breaks the spatial self-correlation that would let the network
     learn a trivial identity mapping of noise.
+
+    IMPORTANT: forward() is fully vectorized — no per-pixel Python loop,
+    no .item() calls inside the loop, no GPU→CPU syncs. The original
+    naive implementation looped over every selected pixel individually,
+    which caused massive slowdowns (minutes per training step). This
+    version processes all pixels across the whole batch in one shot
+    using gather/scatter operations.
     """
 
     def __init__(self,
@@ -232,46 +239,52 @@ class WeightedSpatialKernel(nn.Module):
         self.probs   = F.softmax(logits, dim=0)        # (K,) — K = window²-1
         self.offsets = offsets                          # list of (dy, dx)
 
-    def _replace_pixels(self, sl: torch.Tensor) -> torch.Tensor:
-        """
-        sl : (C, H, W) float32
-        Returns a new tensor with replace_ratio of pixels substituted.
-        """
-        C, H, W  = sl.shape
-        out      = sl.clone()
-        n_pixels = max(1, int(H * W * self.replace_ratio))
-
-        # Random pixel positions to replace
-        flat_idx = torch.randperm(H * W, device=sl.device)[:n_pixels]
-        p_y      = flat_idx // W
-        p_x      = flat_idx % W
-
-        # Sample replacement offsets for all pixels at once
-        chosen = torch.multinomial(
-            self.probs.unsqueeze(0).expand(n_pixels, -1).to(sl.device),
-            num_samples=1).squeeze(1)   # (n_pixels,)
-
-        for i in range(n_pixels):
-            dy, dx = self.offsets[chosen[i].item()]
-            q_y    = (p_y[i] + dy).clamp(0, H - 1)
-            q_x    = (p_x[i] + dx).clamp(0, W - 1)
-            out[:, p_y[i], p_x[i]] = sl[:, q_y, q_x]
-
-        return out
-
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
+        Fully vectorized blind-spot pixel replacement.
+
         features : (B, N, C, H, W)
         Returns  : (B, N, C, H, W) with blind-spot pixel replacement
         """
         B, N, C, H, W = features.shape
-        out = features.clone()
+        device = features.device
+        BN     = B * N
+        flat   = features.view(BN, C, H, W)
 
-        for b in range(B):
-            for n in range(N):
-                out[b, n] = self._replace_pixels(features[b, n])
+        n_pixels = max(1, int(H * W * self.replace_ratio))
 
-        return out
+        # Random pixel positions to replace — one independent set per (batch, slice)
+        flat_idx = torch.stack([
+            torch.randperm(H * W, device=device)[:n_pixels]
+            for _ in range(BN)
+        ], dim=0)                              # (BN, n_pixels)
+        p_y = flat_idx // W
+        p_x = flat_idx % W
+
+        # Sample replacement offsets for ALL pixels at once
+        probs  = self.probs.to(device)
+        chosen = torch.multinomial(
+            probs.unsqueeze(0).expand(BN * n_pixels, -1),
+            num_samples=1
+        ).squeeze(1).view(BN, n_pixels)         # (BN, n_pixels)
+
+        offsets_tensor = torch.tensor(self.offsets, device=device)  # (K, 2)
+        dy = offsets_tensor[chosen][..., 0]
+        dx = offsets_tensor[chosen][..., 1]
+
+        q_y = (p_y + dy).clamp(0, H - 1)
+        q_x = (p_x + dx).clamp(0, W - 1)
+
+        # Vectorized gather + scatter replacement
+        flat_reshaped = flat.view(BN, C, H * W)
+        src_idx = (q_y * W + q_x).unsqueeze(1).expand(-1, C, -1)
+        gathered = torch.gather(flat_reshaped, 2, src_idx)
+
+        out_flat = flat.clone().view(BN, C, H * W)
+        dst_idx  = (p_y * W + p_x).unsqueeze(1).expand(-1, C, -1)
+        out_flat.scatter_(2, dst_idx, gathered)
+
+        return out_flat.view(B, N, C, H, W)
 
 
 # ── Combined STS Module ───────────────────────────────────────────────────────

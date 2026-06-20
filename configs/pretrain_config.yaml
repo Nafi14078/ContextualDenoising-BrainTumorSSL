@@ -42,4 +42,4 @@ training:
   seed:             42
 
 logging:
-  log_every:        50           # steps
+  log_every:        10           # steps

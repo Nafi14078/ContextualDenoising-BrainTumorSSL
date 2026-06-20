@@ -9,6 +9,9 @@ Key behaviours:
   • Training stops when slice-consistency loss L2 converges (< delta)
     OR max_epochs is reached
   • Encoder weights saved after training for transfer to Swin UNETR
+  • Live tqdm progress bar shows samples processed / total / % / loss
+  • _denoise_full_window reuses the already-computed `sampled` tensor —
+    no redundant feature extraction or STS sampling (major speed fix)
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -27,6 +30,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
 
 # Local imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -107,14 +111,17 @@ def train_one_epoch(model:       UNetDenoiser,
     sts.train()
     running = defaultdict(float)
 
-    for step, batch in enumerate(loader):
+    batch_size    = loader.batch_size
+    total_samples = len(loader.dataset)
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs}", unit="batch")
+
+    for step, batch in enumerate(pbar):
         noisy  = batch["noisy"].to(device)    # (B, N, 4, H, W)
         clean  = batch["clean"].to(device)    # (B, N, 4, H, W)
         C_idx  = batch["central"][0].item()   # scalar (same for all in batch)
 
         # Reference for L1 loss (recurrent — from previous epoch)
-        # batch indices: we use the step as a proxy key
-        # In a real setup you'd track dataset indices through the loader
         noisy_central = noisy[:, C_idx]       # (B, 4, H, W)
         ref_key       = epoch * len(loader) + step  # unique per step
         reference     = ref_cache.get(ref_key, noisy_central)
@@ -125,20 +132,15 @@ def train_one_epoch(model:       UNetDenoiser,
             # Step 1: Feature extraction G_φ
             features = model.extract_all_features(noisy)  # (B, N, 21, H, W)
 
-            # Step 2: STS sampling (𝒯 + 𝒮)
+            # Step 2: STS sampling (𝒯 + 𝒮) — computed ONCE, reused below
             sampled  = sts(features, noisy, epoch, max_epochs)  # (B, N, 21, H, W)
 
             # Step 3: Denoise central slice
             denoised_central = model(sampled)              # (B, 4, H, W)
 
-            # Step 4: Compute losses
-            # For L2 we need denoised versions of ALL slices in the window.
-            # Full window denoising is expensive; we use a single forward pass
-            # by treating each slice as the "central" in sequence.
-            # Efficient approximation: use clean as the denoised window proxy
-            # during early epochs, then refine.
+            # Step 4: Reuse `sampled` for full-window denoising (no recompute)
             denoised_window = _denoise_full_window(
-                model, sts, noisy, epoch, max_epochs)     # (B, N, 4, H, W)
+                model, sampled, sts.T.N)                  # (B, N, 4, H, W)
 
             loss_dict = criterion(denoised_central, reference, denoised_window)
             loss      = loss_dict["total"]
@@ -156,31 +158,37 @@ def train_one_epoch(model:       UNetDenoiser,
         for k, v in loss_dict.items():
             running[k] += v.item()
 
+        # ── Live progress bar — updates every batch ──
+        samples_done = (step + 1) * batch_size
+        pct = samples_done / total_samples * 100
+        pbar.set_postfix({
+            "samples": f"{samples_done}/{total_samples}",
+            "%":       f"{pct:.1f}",
+            "loss":    f"{loss.item():.4f}"
+        })
+
         if (step + 1) % log_every == 0:
             avg = {k: v / log_every for k, v in running.items()}
-            print(f"  [Epoch {epoch+1}] step {step+1}/{len(loader)} | "
-                  + " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
+            tqdm.write(f"  [Epoch {epoch+1}] step {step+1}/{len(loader)} "
+                      f"({pct:.1f}%) | "
+                      + " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
             running = defaultdict(float)
 
     return {k: v / len(loader) for k, v in running.items()}
 
 
-def _denoise_full_window(model, sts, noisy, epoch, max_epochs):
+def _denoise_full_window(model, sampled, N):
     """
     Efficiently denoise all N slices by rotating the 'central' position.
-    Uses torch.no_grad() for non-central slices to save memory.
-    Returns (B, N, 4, H, W).
+    Reuses the already-computed `sampled` tensor (output of STS module) —
+    avoids redundant feature extraction and STS sampling.
+
+    sampled : (B, N, feat_ch, H, W) — output of sts(features, ...)
+    Returns : (B, N, 4, H, W)
     """
-    B, N, C, H, W = noisy.shape
     denoised_slices = []
-
-    features = model.extract_all_features(noisy)   # (B, N, 21, H, W)
-    sampled  = sts(features, noisy, epoch, max_epochs)
-
     with torch.no_grad():
         for n in range(N):
-            # Shift the window so slice n is in the centre position
-            # by rolling the feature tensor (cheap approximation)
             shift   = N // 2 - n
             shifted = torch.roll(sampled, shifts=shift, dims=1)
             out     = model(shifted)                # (B, 4, H, W)
@@ -224,7 +232,7 @@ def validate(model:    UNetDenoiser,
             all_psnr.append(compute_psnr(c, d))
             all_ssim.append(compute_ssim(c, d))
 
-        dw       = _denoise_full_window(model, sts, noisy, epoch, max_epochs)
+        dw       = _denoise_full_window(model, sampled, sts.T.N)
         ld       = criterion(denoised, clean_central, dw)
         total_l1 += ld["l1"].item()
         total_l2 += ld["l2"].item()
@@ -276,12 +284,12 @@ def main(cfg_path: str):
     ).to(device)
 
     criterion  = PretrainLoss(lambda_consistency=1.0)
-    optimizer = torch.optim.Adam(
+    optimizer  = torch.optim.Adam(
         list(model.parameters()) + list(sts.parameters()),
-        lr=float(cfg["training"]["lr"]),
-        betas=(float(cfg["training"]["beta1"]),
-               float(cfg["training"]["beta2"])),
-        weight_decay=float(cfg["training"]["weight_decay"])
+        lr           = float(cfg["training"]["lr"]),
+        betas        = (float(cfg["training"]["beta1"]),
+                        float(cfg["training"]["beta2"])),
+        weight_decay = float(cfg["training"]["weight_decay"])
     )
     scheduler  = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=cfg["training"]["lr_decay_step"], gamma=0.5)
