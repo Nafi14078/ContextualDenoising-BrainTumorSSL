@@ -138,7 +138,8 @@ def train_one_epoch(model:       UNetDenoiser,
 
     model.train()
     sts.train()
-    running = defaultdict(float)
+    running      = defaultdict(float)   # resets every log_every steps (for periodic logging)
+    epoch_totals = defaultdict(float)   # NEVER resets — used for the true epoch-end average
 
     batch_size    = loader.batch_size
     total_samples = len(loader.dataset)
@@ -182,7 +183,8 @@ def train_one_epoch(model:       UNetDenoiser,
         scaler.update()
 
         for k, v in loss_dict.items():
-            running[k] += v.item()
+            running[k]      += v.item()
+            epoch_totals[k] += v.item()
 
         # ── Live progress bar — updates every batch ──
         samples_done = (step + 1) * batch_size
@@ -200,7 +202,7 @@ def train_one_epoch(model:       UNetDenoiser,
                       + " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
             running = defaultdict(float)
 
-    return {k: v / len(loader) for k, v in running.items()}
+    return {k: v / len(loader) for k, v in epoch_totals.items()}
 
 
 def _denoise_full_window(model, sampled, N):
