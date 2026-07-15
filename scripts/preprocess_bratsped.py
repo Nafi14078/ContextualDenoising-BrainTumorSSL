@@ -206,8 +206,9 @@ def main(args):
             print(f"  [WARN] {e} — skipping")
             continue
 
-        # Balance: keep all tumor slices, sample equal # of normal
-        n_keep_normal = min(len(normal_sl), len(tumor_sl))
+        # 3:1 tumor-to-normal ratio — keeps model sensitive to tumor
+        # while still seeing enough normal context for background prediction
+        n_keep_normal = min(len(normal_sl), len(tumor_sl) // 3)
         normal_sl     = random.sample(normal_sl, n_keep_normal)
         all_slices    = tumor_sl + normal_sl
 

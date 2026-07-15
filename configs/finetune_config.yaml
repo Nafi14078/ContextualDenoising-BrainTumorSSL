@@ -3,19 +3,19 @@
 # ─────────────────────────────────────────────
 
 data:
-  bratsped_root:    "/kaggle/input/bratsped-preprocessed/train"
-  output_slices:    "/kaggle/input/bratsped-preprocessed/slices"
-  modalities:       ["t1", "t1ce", "t2", "flair"]
+  bratsped_root:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
+  output_slices:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
+  modalities:       ["t1n", "t1c", "t2w", "t2f"]   # BraTS-PED 2023 naming
   axis:             2
   slice_skip:       10
-  min_tumor_ratio:  0.01         # for fine-tune, also keep tumor-containing slices
+  min_tumor_ratio:  0.01
   img_size:         240
   patch_size:       192
   val_split:        0.15
   num_classes:      4            # 0=bg, 1=NCR/NET, 2=ED, 3=ET
 
 model:
-  pretrained_encoder: "/kaggle/input/pretrained-weights/pretrain_encoder.pth"
+  pretrained_encoder: "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/pretrain_encoder_best.pth"
   in_channels:      4
   out_channels:     4
   feature_size:     48           # Swin UNETR feature size
@@ -24,15 +24,15 @@ model:
 training:
   # Phase 1 — decoder warmup (encoder frozen)
   phase1_epochs:    30
-  phase1_lr:        1e-4
+  phase1_lr:        0.0001       # was 1e-4 — fixed to avoid PyYAML string-parsing bug
   # Phase 2 — full fine-tuning (encoder unfrozen)
   phase2_epochs:    70
-  phase2_lr:        5e-5
+  phase2_lr:        0.00005      # was 5e-5
 
   batch_size:       8            # 2D is much lighter than 3D
-  weight_decay:     1e-5
+  weight_decay:     0.00001      # was 1e-5
   amp:              true
-  use_checkpoint:   true         # gradient checkpointing
+  use_checkpoint:   true         # gradient checkpointing — essential on Kaggle T4
   save_every:       5
   checkpoint_dir:   "/kaggle/working/checkpoints/finetune"
   seed:             42
