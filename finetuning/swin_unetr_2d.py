@@ -1,241 +1,326 @@
 """
 finetuning/swin_unetr_2d.py
 ────────────────────────────────────────────────────────────────────────────────
-2D Swin UNETR for BraTS-PED tumor segmentation.
+2D Segmentation U-Net for BraTS-PED tumor segmentation.
 
-Why 2D Swin UNETR:
-  • MONAI's SwinUNETR works in both 2D and 3D — we use 2D mode
-  • The Swin Transformer encoder can accept pretrained weights from our
-    pretraining phase (partial weight injection)
-  • Spatial_dims=2 reduces compute significantly — feasible on Kaggle T4
+ARCHITECTURE CHANGE FROM ORIGINAL DESIGN:
+  The original plan used Swin UNETR as the fine-tuning backbone. However,
+  Swin UNETR is a Vision Transformer, and our pretraining produced a
+  convolutional U-Net encoder (feature_extractor + enc1 + enc2 + bottleneck).
+  These architectures are completely incompatible — weight transfer would
+  match 0 out of 48 layers, making the "transfer learning" claim empty.
 
-Weight injection strategy:
-  Our pretrained U-Net encoder has different architecture than Swin UNETR,
-  so we CANNOT do a 1:1 layer mapping. Instead we use a hybrid approach:
+  This file uses a SEGMENTATION U-NET that shares the EXACT SAME encoder
+  architecture as the pretraining U-Net (UNetDenoiser). This gives:
+    • Direct, verified weight transfer of all 48 encoder layers
+    • The encoder starts from pretrained denoising representations
+    • Only the decoder + segmentation head are trained from scratch (Phase 1)
+    • Phase 2 fine-tunes everything end-to-end
 
-  Option A (default): Load MONAI's official self-supervised pretrained weights
-                      for Swin UNETR encoder (trained on 5000 CT/MRI volumes),
-                      THEN replace/fine-tune with our weights where shapes match.
+  This is architecturally cleaner and gives the strongest thesis argument:
+  "our pretrained encoder, transferred directly, improves segmentation Dice."
 
-  Option B: Train Swin UNETR from scratch but with a pretrained CONVOLUTIONAL
-            stem that mirrors our U-Net feature extractor. This lets our
-            pretrained features directly influence the patch embedding.
+  The thesis claim is the same — SSL pretraining on BraTS2021 → transfer to
+  BraTS-PED segmentation — just with a backbone that actually supports it.
 
-  We implement Option B since it gives the strongest thesis argument
-  ("our pretraining directly helps") and is architecturally cleaner.
+TWO-PHASE TRAINING:
+  Phase 1: freeze pretrained encoder, train decoder + seg head only
+  Phase 2: unfreeze all, fine-tune end-to-end with differential LR
 ────────────────────────────────────────────────────────────────────────────────
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from monai.networks.nets import SwinUNETR
-    MONAI_AVAILABLE = True
-except ImportError:
-    MONAI_AVAILABLE = False
-    print("[WARN] MONAI not found. Run: pip install monai")
+from pathlib import Path
 
 
-# ── Pretrained Convolutional Patch Embedding ──────────────────────────────────
+# ── Building blocks (same as pretraining/unet_denoiser.py) ───────────────────
 
-class PretrainedPatchEmbedding(nn.Module):
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel=3, groups=8):
+        super().__init__()
+        pad     = kernel // 2
+        gn_grps = min(groups, out_ch)
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel, padding=pad, bias=False),
+            nn.GroupNorm(gn_grps, out_ch),
+            nn.GELU()
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class EncoderBlock(nn.Module):
+    """Identical to pretraining EncoderBlock — receives pretrained weights."""
+    def __init__(self, in_ch, out_ch, gn_groups=8):
+        super().__init__()
+        self.convs = nn.Sequential(
+            ConvBlock(in_ch,  out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+        )
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        feat   = self.convs(x)
+        pooled = self.pool(feat)
+        return pooled, feat
+
+
+class SegDecoderBlock(nn.Module):
     """
-    Replaces Swin UNETR's default patch embedding with our pretrained
-    feature extractor G_φ + an additional projection layer.
+    Decoder block for segmentation.
+    Same structure as pretraining DecoderBlock but with 6 conv layers
+    as in the original paper description.
+    Trained from scratch in Phase 1 (encoder is frozen).
+    """
+    def __init__(self, in_ch, skip_ch, out_ch, gn_groups=8):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, 2, stride=2)
+        merged  = (in_ch // 2) + skip_ch
+        self.convs = nn.Sequential(
+            ConvBlock(merged,  out_ch, groups=gn_groups),
+            ConvBlock(out_ch,  out_ch, groups=gn_groups),
+            ConvBlock(out_ch,  out_ch, groups=gn_groups),
+            ConvBlock(out_ch,  out_ch, groups=gn_groups),
+        )
 
-    Our G_φ outputs 21 channels at full resolution.
-    Swin UNETR needs patch tokens of size (feature_size,) = (48,).
-    We add a learnable projection: 21 → 48 with 4×4 stride (patch size).
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape != skip.shape:
+            x = F.interpolate(x, size=skip.shape[2:],
+                              mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.convs(x)
+
+
+class FeatureExtractor(nn.Module):
+    """
+    Identical to pretraining FeatureExtractor (G_φ).
+    Must match exactly so pretrained weights load correctly.
+    """
+    def __init__(self, in_ch=4, feat_ch=21):
+        super().__init__()
+        gn = min(3, feat_ch)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, feat_ch, 3, padding=1, bias=False, groups=1),
+            nn.GroupNorm(gn, feat_ch), nn.GELU(),
+            nn.Conv2d(feat_ch, feat_ch, 3, padding=1, bias=False, groups=3),
+            nn.GroupNorm(gn, feat_ch), nn.GELU(),
+            nn.Conv2d(feat_ch, feat_ch, 3, padding=1, bias=False, groups=3),
+            nn.GroupNorm(gn, feat_ch), nn.GELU(),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+# ── Main segmentation model ───────────────────────────────────────────────────
+
+class SegUNet2D(nn.Module):
+    """
+    2D Segmentation U-Net whose encoder is initialised from pretrained
+    denoising weights (feature_extractor + enc1 + enc2 + bottleneck).
+
+    Input  : (B, 4, H, W)   — 4 MRI modalities
+    Output : (B, num_classes, H, W)  — raw logits
+
+    Encoder layers match pretraining UNetDenoiser exactly:
+      feature_extractor → 21-channel low-level features
+      enc1              → 48-channel spatial features (stride 2)
+      enc2              → 96-channel semantic features (stride 4)
+      bottleneck        → 192-channel deep features (stride 4)
+
+    Decoder + head are NEW (random init), trained in Phase 1 with encoder frozen.
     """
 
     def __init__(self,
                  in_channels:  int = 4,
+                 num_classes:  int = 4,
+                 base_ch:      int = 48,
                  feat_ch:      int = 21,
-                 feature_size: int = 48,
-                 patch_size:   int = 4):
+                 gn_groups:    int = 8):
         super().__init__()
+        self.feat_ch = feat_ch
 
-        # Mirror of G_φ from pretraining (will receive pretrained weights)
-        from pretraining.unet_denoiser import FeatureExtractor
+        # ── Encoder (matches pretraining UNetDenoiser) ──
         self.feature_extractor = FeatureExtractor(in_channels, feat_ch)
+        self.enc1 = EncoderBlock(feat_ch,      base_ch,     gn_groups)
+        self.enc2 = EncoderBlock(base_ch,      base_ch * 2, gn_groups)
 
-        # Projection to Swin feature size (learnable, trained from scratch)
-        self.proj = nn.Conv2d(feat_ch, feature_size,
-                              kernel_size=patch_size,
-                              stride=patch_size,
-                              bias=False)
-        self.norm = nn.LayerNorm(feature_size)
-
-    def forward(self, x):
-        # x : (B, 4, H, W)
-        feat = self.feature_extractor(x)    # (B, 21, H, W)
-        feat = self.proj(feat)              # (B, 48, H/4, W/4)
-        B, C, H, W = feat.shape
-        feat = feat.flatten(2).transpose(1, 2)  # (B, H*W/16, 48)
-        feat = self.norm(feat)
-        return feat, H, W
-
-
-# ── 2D Swin UNETR Wrapper ─────────────────────────────────────────────────────
-
-class SwinUNETR2D(nn.Module):
-    """
-    Thin wrapper around MONAI SwinUNETR configured for 2D.
-    Adds pretrained weight loading and two-phase training support.
-    """
-
-    def __init__(self,
-                 img_size:         int = 192,
-                 in_channels:      int = 4,
-                 out_channels:     int = 4,
-                 feature_size:     int = 48,
-                 use_checkpoint:   bool = True,
-                 drop_rate:        float = 0.0,
-                 attn_drop_rate:   float = 0.0):
-        super().__init__()
-
-        assert MONAI_AVAILABLE, "Install MONAI: pip install monai"
-
-        self.model = SwinUNETR(
-            img_size       = (img_size, img_size),
-            in_channels    = in_channels,
-            out_channels   = out_channels,
-            feature_size   = feature_size,
-            spatial_dims   = 2,             # ← 2D mode
-            use_checkpoint = use_checkpoint,
-            drop_rate      = drop_rate,
-            attn_drop_rate = attn_drop_rate,
+        # ── Bottleneck (matches pretraining) ──
+        self.bottleneck = nn.Sequential(
+            ConvBlock(base_ch * 2, base_ch * 4, groups=gn_groups),
+            ConvBlock(base_ch * 4, base_ch * 4, groups=gn_groups),
+            ConvBlock(base_ch * 4, base_ch * 4, groups=gn_groups),
         )
 
-        self.feature_size = feature_size
+        # ── Decoder (NEW — trained from scratch) ──
+        self.dec2 = SegDecoderBlock(base_ch * 4, base_ch * 2,
+                                    base_ch * 2, gn_groups)
+        self.dec1 = SegDecoderBlock(base_ch * 2, base_ch,
+                                    base_ch,     gn_groups)
+        self.dec0 = SegDecoderBlock(base_ch,     feat_ch,
+                                    base_ch // 2, gn_groups)
+
+        # ── Segmentation head (NEW) ──
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(base_ch // 2, base_ch // 2, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(base_ch // 2, num_classes, 1)
+        )
+
+        # Track which layers are "pretrained" for freeze/unfreeze
+        self._encoder_modules = [
+            "feature_extractor", "enc1", "enc2", "bottleneck"
+        ]
 
     def forward(self, x):
-        """
-        x   : (B, 4, H, W)
-        out : (B, num_classes, H, W)  — raw logits
-        """
-        return self.model(x)
+        # Feature extraction
+        f0 = self.feature_extractor(x)     # (B, feat_ch, H, W)
 
-    def load_pretrained_encoder(self,
-                                pretrained_path: str,
+        # Encoder
+        x1, skip1 = self.enc1(f0)          # x1: (B, 48, H/2, W/2)
+        x2, skip2 = self.enc2(x1)          # x2: (B, 96, H/4, W/4)
+
+        # Bottleneck
+        x3 = self.bottleneck(x2)           # (B, 192, H/4, W/4)
+
+        # Decoder with skip connections
+        x  = self.dec2(x3, skip2)          # (B, 96, H/2, W/2)
+        x  = self.dec1(x,  skip1)          # (B, 48, H, W)
+        x  = self.dec0(x,  f0)             # (B, 24, H, W)
+
+        return self.seg_head(x)            # (B, num_classes, H, W)
+
+    # ── Pretrained weight loading ─────────────────────────────────────────────
+
+    def load_pretrained_encoder(self, pretrained_path: str,
                                 verbose: bool = True) -> int:
         """
-        Inject pretrained weights from our U-Net pretraining.
+        Load encoder weights from pretraining checkpoint.
 
-        The strategy: match any layer where:
-          1. The key exists in both state dicts
-          2. The shapes are identical
+        Since encoder architecture is IDENTICAL to pretraining, all 48
+        encoder layers will match perfectly — not just partial matching.
 
-        In practice, the Swin UNETR patch embedding Conv2d and our
-        feature_extractor Conv2d layers don't share names, so matched
-        count will be low — but the patch embedding projection weights
-        (if we use PretrainedPatchEmbedding) will match perfectly.
-
-        For the thesis, this partial matching is sufficient to demonstrate
-        the transfer learning principle. Full matching requires either:
-          (a) Using the same architecture for pre/fine-tune (pure U-Net)
-          (b) Using MONAI's official SSL pretrained weights as init +
-              our weights as a secondary fine-tune signal
-
-        Returns: number of matched layers
+        Returns: number of matched layers (expect 48)
         """
         pretrained = torch.load(pretrained_path, map_location="cpu")
-        model_dict = self.model.state_dict()
+        model_dict = self.state_dict()
 
-        matched = {}
-        skipped = []
+        matched  = {}
+        skipped  = []
+        misshape = []
+
         for k, v in pretrained.items():
-            # Try direct match
-            if k in model_dict and model_dict[k].shape == v.shape:
-                matched[k] = v
-            # Try stripping "feature_extractor." prefix
-            elif k.startswith("feature_extractor."):
-                k2 = k.replace("feature_extractor.", "")
-                if k2 in model_dict and model_dict[k2].shape == v.shape:
-                    matched[k2] = v
+            if k in model_dict:
+                if model_dict[k].shape == v.shape:
+                    matched[k] = v
+                else:
+                    misshape.append(
+                        f"{k}: pretrained {v.shape} vs model {model_dict[k].shape}")
             else:
                 skipped.append(k)
 
         model_dict.update(matched)
-        self.model.load_state_dict(model_dict, strict=False)
+        self.load_state_dict(model_dict, strict=False)
 
         if verbose:
             print(f"[Weight Transfer] Matched {len(matched)} / "
-                  f"{len(model_dict)} layers")
-            if skipped[:5]:
-                print(f"  Example unmatched keys: {skipped[:3]}")
+                  f"{len(pretrained)} pretrained layers")
+            if len(matched) == len(pretrained):
+                print("  ✓ ALL pretrained encoder layers loaded successfully")
+            if misshape:
+                print(f"  Shape mismatches ({len(misshape)}):")
+                for m in misshape[:3]:
+                    print(f"    {m}")
+            if skipped:
+                print(f"  Skipped (not in model): {skipped[:3]}")
 
         return len(matched)
 
-    def load_monai_ssl_weights(self, ssl_weights_path: str):
-        """
-        Load MONAI's official self-supervised pretrained Swin encoder.
-        Download from:
-          https://github.com/Project-MONAI/MONAI-extra-test-data/
-          releases/download/0.8.1/model_swinvit.pt
-
-        These weights are pretrained on 5050 CT/MRI segmentation volumes
-        and typically give a strong starting point for BraTS fine-tuning.
-        """
-        ssl_weights = torch.load(ssl_weights_path, map_location="cpu")
-        # MONAI SSL weights use "swinViT." prefix
-        self.model.load_from(ssl_weights)
-        print("[Weight Transfer] MONAI SSL Swin encoder weights loaded")
-
-    # ── Two-phase training helpers ──────────────────────────────────────────
+    # ── Two-phase training helpers ────────────────────────────────────────────
 
     def freeze_encoder(self):
-        """Phase 1: freeze Swin encoder, train decoder only."""
-        for name, param in self.model.named_parameters():
-            if "swinViT" in name:
+        """
+        Phase 1: freeze all pretrained encoder layers.
+        Only decoder + seg_head gradients flow.
+        """
+        frozen = 0
+        for name, param in self.named_parameters():
+            if any(name.startswith(m) for m in self._encoder_modules):
                 param.requires_grad = False
-        n_frozen = sum(1 for n, p in self.model.named_parameters()
-                       if not p.requires_grad)
-        print(f"[Phase 1] Frozen {n_frozen} encoder parameters")
+                frozen += 1
+            else:
+                param.requires_grad = True
+
+        trainable = sum(p.numel() for p in self.parameters()
+                        if p.requires_grad)
+        print(f"[Phase 1] Frozen {frozen} encoder params | "
+              f"Trainable: {trainable:,} params (decoder + head)")
 
     def unfreeze_all(self):
-        """Phase 2: unfreeze everything for full fine-tuning."""
-        for param in self.model.parameters():
+        """Phase 2: unfreeze everything."""
+        for param in self.parameters():
             param.requires_grad = True
-        print("[Phase 2] All parameters unfrozen")
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[Phase 2] All {total:,} parameters unfrozen")
 
-    def get_parameter_groups(self, phase1_lr: float, phase2_lr: float):
+    def get_parameter_groups(self, phase1_lr: float,
+                             phase2_lr: float) -> list:
         """
-        Return parameter groups with different LRs for encoder vs decoder.
-        Used in Phase 2 to avoid destroying encoder representations.
+        Differential LR for Phase 2:
+          encoder (pretrained) → 10× lower LR to protect learned features
+          decoder + head (new) → full phase2_lr
         """
-        encoder_params = [p for n, p in self.model.named_parameters()
-                          if "swinViT" in n and p.requires_grad]
-        decoder_params = [p for n, p in self.model.named_parameters()
-                          if "swinViT" not in n and p.requires_grad]
+        encoder_params = [p for n, p in self.named_parameters()
+                          if any(n.startswith(m)
+                                 for m in self._encoder_modules)]
+        decoder_params = [p for n, p in self.named_parameters()
+                          if not any(n.startswith(m)
+                                     for m in self._encoder_modules)]
         return [
-            {"params": encoder_params, "lr": phase1_lr * 0.1},  # 10× lower
+            {"params": encoder_params, "lr": phase2_lr * 0.1},
             {"params": decoder_params, "lr": phase2_lr},
         ]
 
 
-def build_model(cfg: dict, device) -> SwinUNETR2D:
-    """Build model and optionally inject pretrained weights."""
-    model = SwinUNETR2D(
-        img_size       = cfg["model"]["img_size"],
-        in_channels    = cfg["model"]["in_channels"],
-        out_channels   = cfg["model"]["out_channels"],
-        feature_size   = cfg["model"]["feature_size"],
-        use_checkpoint = cfg["training"]["use_checkpoint"],
+# ── Build function ────────────────────────────────────────────────────────────
+
+def build_model(cfg: dict, device) -> SegUNet2D:
+    """Build segmentation model and load pretrained encoder weights."""
+
+    model = SegUNet2D(
+        in_channels = cfg["model"]["in_channels"],
+        num_classes = cfg["model"]["out_channels"],
+        base_ch     = cfg["model"].get("base_channels", 48),
+        feat_ch     = cfg["model"].get("feat_ch", 21),
+        gn_groups   = cfg["model"].get("group_norm_groups", 8),
     ).to(device)
 
     pretrained_path = cfg["model"].get("pretrained_encoder", None)
     if pretrained_path:
-        from pathlib import Path
         if Path(pretrained_path).exists():
             matched = model.load_pretrained_encoder(pretrained_path)
             if matched == 0:
-                print("[WARN] No layers matched. Consider using MONAI SSL weights.")
-                print("       Continuing with random init for encoder.")
+                print("[WARN] No layers matched — check encoder architecture "
+                      "matches pretraining UNetDenoiser exactly.")
+            elif matched == 48:
+                print(f"  ✓ Perfect transfer: all 48 encoder layers loaded")
+            else:
+                print(f"  Partial transfer: {matched}/48 layers loaded")
         else:
-            print(f"[WARN] Pretrained path not found: {pretrained_path}")
-            print("       Training from scratch.")
+            print(f"[WARN] Pretrained encoder not found: {pretrained_path}")
+            print("       Training decoder from scratch (ablation baseline).")
+    else:
+        print("[INFO] No pretrained encoder specified — random init.")
+
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters()
+                           if p.requires_grad)
+    print(f"  Model params: {total_params:,} total | "
+          f"{trainable_params:,} trainable")
 
     return model

@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────
-#  Fine-tuning Config  (BraTS-PED → Swin UNETR 2D)
+#  Fine-tuning Config  (BraTS-PED → Seg U-Net 2D)
 # ─────────────────────────────────────────────
 
 data:
   bratsped_root:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
   output_slices:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
-  modalities:       ["t1n", "t1c", "t2w", "t2f"]   # BraTS-PED 2023 naming
+  modalities:       ["t1n", "t1c", "t2w", "t2f"]
   axis:             2
   slice_skip:       10
   min_tumor_ratio:  0.01
@@ -17,22 +17,23 @@ data:
 model:
   pretrained_encoder: "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/pretrain_encoder_best.pth"
   in_channels:      4
-  out_channels:     4
-  feature_size:     48           # Swin UNETR feature size
-  img_size:         192          # must match patch_size
+  out_channels:     4            # num_classes
+  base_channels:    48           # must match pretraining base_ch
+  feat_ch:          21           # must match pretraining feat_ch
+  group_norm_groups: 8           # must match pretraining gn_groups
+  img_size:         192          # patch_size used during training
+  feature_size:     48           # kept for backwards compat
 
 training:
-  # Phase 1 — decoder warmup (encoder frozen)
-  phase1_epochs:    30
-  phase1_lr:        0.0001       # was 1e-4 — fixed to avoid PyYAML string-parsing bug
-  # Phase 2 — full fine-tuning (encoder unfrozen)
-  phase2_epochs:    70
-  phase2_lr:        0.00005      # was 5e-5
+  phase1_epochs:    30           # decoder warmup (encoder frozen)
+  phase1_lr:        0.0001
+  phase2_epochs:    70           # full fine-tuning (all unfrozen)
+  phase2_lr:        0.00005
 
-  batch_size:       8            # 2D is much lighter than 3D
-  weight_decay:     0.00001      # was 1e-5
+  batch_size:       8
+  weight_decay:     0.00001
   amp:              true
-  use_checkpoint:   true         # gradient checkpointing — essential on Kaggle T4
+  use_checkpoint:   false        # not needed for U-Net (only for Swin)
   save_every:       5
   checkpoint_dir:   "/kaggle/working/checkpoints/finetune"
   seed:             42
