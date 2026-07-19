@@ -69,25 +69,44 @@ def load_checkpoint(path, model, optimizer, scaler, scheduler, device):
     Returns: (start_epoch, start_phase, best_dice)
       - start_phase: 1 or 2 — which phase to resume from
       - start_epoch: which epoch within that phase to start at
+
+    Handles optimizer group mismatch gracefully: if the checkpoint was saved
+    in a different phase than the optimizer currently passed in (e.g. Phase 2
+    checkpoint loaded with Phase 1 optimizer), optimizer state is skipped
+    rather than crashing. Model weights and phase/epoch info still load correctly.
     """
     print(f"\n[Resume] Loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=device)
 
+    # ── Model weights — always load ──
     model.load_state_dict(ckpt["model"])
 
+    # ── Optimizer — skip gracefully if group count doesn't match ──
     if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt_groups   = len(ckpt["optimizer"]["param_groups"])
+        model_groups  = len(optimizer.param_groups)
+        if ckpt_groups == model_groups:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        else:
+            print(f"  [WARN] Optimizer group mismatch: checkpoint has "
+                  f"{ckpt_groups} groups, current optimizer has "
+                  f"{model_groups} groups.")
+            print(f"  [WARN] This happens when resuming a Phase "
+                  f"{ckpt.get('phase','?')} checkpoint with a different "
+                  f"phase optimizer. Optimizer state skipped — "
+                  f"LR and momentum restart fresh for this phase.")
     else:
         print("  [WARN] No optimizer state in checkpoint — "
               "optimizer restarts fresh")
 
+    # ── Scaler ──
     if scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
 
+    # ── Scheduler ──
     if scheduler is not None and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
     elif scheduler is not None and "epoch" in ckpt:
-        # Older checkpoint without scheduler state — fast-forward
         for _ in range(ckpt["epoch"] + 1):
             scheduler.step()
         print(f"  [WARN] No scheduler state — fast-forwarded "

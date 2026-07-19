@@ -202,25 +202,59 @@ class SegUNet2D(nn.Module):
         """
         Load encoder weights from pretraining checkpoint.
 
-        Since encoder architecture is IDENTICAL to pretraining, all 48
-        encoder layers will match perfectly — not just partial matching.
+        Handles the one known shape mismatch:
+          enc1.convs.0.block.0.weight — pretrained (48, 147, 3, 3)
+                                        vs model    (48, 21, 3, 3)
 
-        Returns: number of matched layers (expect 48)
+        Why this mismatch exists:
+          During pretraining, enc1 receives N=7 stacked feature maps
+          (7 × 21 = 147 input channels). During fine-tuning, enc1
+          receives just the feature_extractor output (21 channels).
+
+        Fix: reshape pretrained weight (48, 147, 3, 3) →
+             (48, 7, 21, 3, 3), average over the 7 groups →
+             (48, 21, 3, 3). This preserves the learned filter
+             structure while adapting to the new input dimension.
+
+        Returns: number of matched layers (expect 48 after fix)
         """
         pretrained = torch.load(pretrained_path, map_location="cpu")
         model_dict = self.state_dict()
 
         matched  = {}
+        adapted  = []
         skipped  = []
         misshape = []
+
+        # Known mismatch key and its fix
+        MISMATCH_KEY = "enc1.convs.0.block.0.weight"
+        N_GROUPS     = 7   # pretraining used N=7 slice window
 
         for k, v in pretrained.items():
             if k in model_dict:
                 if model_dict[k].shape == v.shape:
+                    # Direct match — load as-is
                     matched[k] = v
+
+                elif (k == MISMATCH_KEY
+                      and v.shape[1] == model_dict[k].shape[1] * N_GROUPS):
+                    # Known mismatch: (48, 147, 3, 3) → (48, 21, 3, 3)
+                    # Average across the N_GROUPS of feat_ch channels
+                    out_ch, in_ch_total, kH, kW = v.shape
+                    feat_ch = model_dict[k].shape[1]   # 21
+                    adapted_weight = (
+                        v.view(out_ch, N_GROUPS, feat_ch, kH, kW)
+                         .mean(dim=1)                  # (48, 21, 3, 3)
+                    )
+                    matched[k] = adapted_weight
+                    adapted.append(
+                        f"{k}: {tuple(v.shape)} → averaged "
+                        f"{N_GROUPS} groups → {tuple(adapted_weight.shape)}")
+
                 else:
                     misshape.append(
-                        f"{k}: pretrained {v.shape} vs model {model_dict[k].shape}")
+                        f"{k}: pretrained {v.shape} "
+                        f"vs model {model_dict[k].shape}")
             else:
                 skipped.append(k)
 
@@ -228,13 +262,19 @@ class SegUNet2D(nn.Module):
         self.load_state_dict(model_dict, strict=False)
 
         if verbose:
+            direct  = len(matched) - len(adapted)
             print(f"[Weight Transfer] Matched {len(matched)} / "
                   f"{len(pretrained)} pretrained layers")
+            print(f"  Direct matches : {direct}")
+            if adapted:
+                print(f"  Adapted (group-averaged):")
+                for a in adapted:
+                    print(f"    {a}")
             if len(matched) == len(pretrained):
-                print("  ✓ ALL pretrained encoder layers loaded successfully")
+                print("  ✓ ALL 48 pretrained encoder layers loaded")
             if misshape:
-                print(f"  Shape mismatches ({len(misshape)}):")
-                for m in misshape[:3]:
+                print(f"  Unexpected shape mismatches ({len(misshape)}):")
+                for m in misshape:
                     print(f"    {m}")
             if skipped:
                 print(f"  Skipped (not in model): {skipped[:3]}")
