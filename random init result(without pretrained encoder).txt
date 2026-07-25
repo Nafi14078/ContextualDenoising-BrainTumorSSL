@@ -1,0 +1,26 @@
+Train — total: 0.1682 | dice: 0.1565 | focal: 0.0117
+  Val   — WT: 0.8077 | TC: 0.7720 | ET: 0.6947 | Mean: 0.7581
+  HD95  — WT: 15.01 | TC: 21.90 | ET: 84.31
+  ✓ Saved → /kaggle/working/checkpoints/finetune_scratch/phase2_epoch_070.pth
+
+✓ Training complete. Best mean Dice: 0.7653
+
+Process exited with code: 0
+
+[INFO] No pretrained encoder specified — random init.
+  Model params: 1,948,084 total | 1,948,084 trainable
+✓ Loaded best model from epoch 51 (Phase 2)
+[Dataset BraTS-PED] train: 3741 slices
+[Dataset BraTS-PED] val: 597 slices
+
+────────────────────────────────────────
+  FINAL EVALUATION METRICS
+────────────────────────────────────────
+  Dice WT             : 0.8148
+  Dice TC             : 0.7769
+  Dice ET             : 0.7040
+  Mean Dice           : 0.7653
+  HD95 WT             : 24.0314
+  HD95 TC             : 34.3413
+  HD95 ET             : 77.1886
+────────────────────────────────────────
