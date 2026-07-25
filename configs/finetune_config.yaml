@@ -12,28 +12,35 @@ data:
   img_size:         240
   patch_size:       192
   val_split:        0.15
-  num_classes:      4            # 0=bg, 1=NCR/NET, 2=ED, 3=ET
+  num_classes:      4
 
 model:
   pretrained_encoder: "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/pretrain_encoder_best.pth"
   in_channels:      4
-  out_channels:     4            # num_classes
-  base_channels:    48           # must match pretraining base_ch
-  feat_ch:          21           # must match pretraining feat_ch
-  group_norm_groups: 8           # must match pretraining gn_groups
-  img_size:         192          # patch_size used during training
-  feature_size:     48           # kept for backwards compat
+  out_channels:     4
+  base_channels:    48
+  feat_ch:          21
+  group_norm_groups: 8
+  img_size:         192
+  feature_size:     48
 
 training:
-  phase1_epochs:    30           # decoder warmup (encoder frozen)
+  phase1_epochs:    30
   phase1_lr:        0.0001
-  phase2_epochs:    70           # full fine-tuning (all unfrozen)
+  phase2_epochs:    70
   phase2_lr:        0.00005
+
+  # Cosine warm restarts (for both joint and two-phase)
+  cosine_T0:        20         # initial cycle length in epochs
+  cosine_Tmult:     2          # cycle length multiplier after each restart
+
+  # Early stopping
+  early_stop_patience: 15      # stop if no EMA Dice improvement for N epochs
 
   batch_size:       8
   weight_decay:     0.00001
   amp:              true
-  use_checkpoint:   false        # not needed for U-Net (only for Swin)
+  use_checkpoint:   false
   save_every:       5
   checkpoint_dir:   "/kaggle/working/checkpoints/finetune"
   seed:             42
