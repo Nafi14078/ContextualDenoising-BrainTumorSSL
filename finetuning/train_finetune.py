@@ -11,22 +11,17 @@ Two training modes (controlled by --joint flag):
 
   JOINT (--joint flag):
     Single phase: all layers trained together from epoch 1
-    Encoder LR = 0.1 x decoder LR (differential, no hard freeze)
-    Recommended when pretrained encoder underperforms two-phase
+    Encoder LR = 0.1 x decoder LR (no hard freeze)
+    Recommended for pretrained encoder
 
-Key improvements vs previous version:
-  - Joint training mode (--joint) addresses encoder/decoder tension
-  - TTA in validation (+2-4% Dice)
-  - EMA-based best model selection (stable checkpointing)
-  - CosineAnnealingWarmRestarts (better LR schedule)
-  - Early stopping (stops when Dice plateaus)
-  - Resume support with optimizer group mismatch handling
-  - All previous fixes retained
+Best model saved on single val Dice (standard research practice).
+TTA used in validation for better accuracy.
+Early stopping when val Dice does not improve for patience epochs.
 
 Run:
     python train_finetune.py --config ../configs/finetune_config.yaml
     python train_finetune.py --config ../configs/finetune_config.yaml --joint
-    python train_finetune.py --config ../configs/finetune_config.yaml --joint --resume /path/to/ckpt.pth
+    python train_finetune.py --config ../configs/finetune_config.yaml --joint --resume /path/ckpt.pth
 """
 
 import sys
@@ -49,6 +44,8 @@ from evaluation.metrics       import (compute_dice_wt, compute_dice_tc,
                                       compute_dice_et, compute_hd95)
 
 
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
 def set_seed(seed):
     import random
     random.seed(seed)
@@ -64,8 +61,13 @@ def save_checkpoint(state, path):
 
 
 def load_checkpoint(path, model, optimizer, scaler, scheduler, device):
+    """
+    Restore full training state. Handles optimizer group mismatch gracefully.
+    Returns: (start_epoch, start_phase, best_dice)
+    """
     print(f"\n[Resume] Loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=device)
+
     model.load_state_dict(ckpt["model"])
 
     if optimizer is not None and "optimizer" in ckpt:
@@ -74,27 +76,31 @@ def load_checkpoint(path, model, optimizer, scaler, scheduler, device):
         if ckpt_groups == model_groups:
             optimizer.load_state_dict(ckpt["optimizer"])
         else:
-            print(f"  [WARN] Optimizer group mismatch ({ckpt_groups} vs {model_groups}) -- restarts fresh")
+            print(f"  [WARN] Optimizer group mismatch "
+                  f"({ckpt_groups} vs {model_groups}) -- restarts fresh")
     else:
         print("  [WARN] No optimizer state -- restarts fresh")
 
     if scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
+
     if scheduler is not None and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
     elif scheduler is not None and "epoch" in ckpt:
         for _ in range(ckpt["epoch"] + 1):
             scheduler.step()
+        print(f"  [WARN] No scheduler state -- fast-forwarded {ckpt['epoch']+1} steps")
 
     start_epoch = ckpt.get("epoch", 0) + 1
     start_phase = ckpt.get("phase", 1)
     best_dice   = ckpt.get("best_dice", -1.0)
-    ema_dice    = ckpt.get("ema_dice",  best_dice)
 
     print(f"  Resumed from Phase {start_phase}, epoch {start_epoch}")
-    print(f"  Best Dice: {best_dice:.4f} | EMA Dice: {ema_dice:.4f}\n")
-    return start_epoch, start_phase, best_dice, ema_dice
+    print(f"  Best Dice so far: {best_dice:.4f}\n")
+    return start_epoch, start_phase, best_dice
 
+
+# ── Test-Time Augmentation ────────────────────────────────────────────────────
 
 @torch.no_grad()
 def predict_tta(model, images, device):
@@ -112,6 +118,8 @@ def predict_tta(model, images, device):
     preds.append(F.softmax(logit, dim=1))
     return torch.stack(preds).mean(0)
 
+
+# ── Training epoch ────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, criterion, optimizer,
                     scaler, device, log_every, use_amp, epoch_label=""):
@@ -150,15 +158,19 @@ def train_one_epoch(model, loader, criterion, optimizer,
 
         if (step + 1) % log_every == 0:
             avg = {k: v / log_every for k, v in running.items()}
-            tqdm.write(f"  {epoch_label} step {step+1}/{len(loader)} ({pct:.1f}%) | " +
-                       " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
+            tqdm.write(
+                f"  {epoch_label} step {step+1}/{len(loader)} ({pct:.1f}%) | " +
+                " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
             running = defaultdict(float)
 
     return {k: v / len(loader) for k, v in epoch_totals.items()}
 
 
+# ── Validation with TTA ───────────────────────────────────────────────────────
+
 @torch.no_grad()
-def validate(model, loader, criterion, device, use_tta=True, epoch_label=""):
+def validate(model, loader, criterion, device,
+             use_tta=True, epoch_label=""):
     model.eval()
     dice_wt, dice_tc, dice_et = [], [], []
     hd95_wt, hd95_tc, hd95_et = [], [], []
@@ -168,6 +180,7 @@ def validate(model, loader, criterion, device, use_tta=True, epoch_label=""):
     for batch in pbar:
         images = batch["image"].to(device)
         masks  = batch["mask"].to(device)
+
         logits    = model(images)
         loss_dict = criterion(logits, masks)
         total_loss += loss_dict["total"].item()
@@ -190,13 +203,16 @@ def validate(model, loader, criterion, device, use_tta=True, epoch_label=""):
                 hd95_et.append(compute_hd95(p == 3,           m == 3))
 
         if dice_wt:
-            pbar.set_postfix({"WT": f"{np.mean(dice_wt):.3f}",
-                               "TC": f"{np.mean(dice_tc):.3f}",
-                               "ET": f"{np.mean(dice_et):.3f}"})
+            pbar.set_postfix({
+                "WT": f"{np.mean(dice_wt):.3f}",
+                "TC": f"{np.mean(dice_tc):.3f}",
+                "ET": f"{np.mean(dice_et):.3f}"})
 
-    mean_dice = float(np.mean([np.mean(dice_wt), np.mean(dice_tc), np.mean(dice_et)]))
+    mean_dice = float(np.mean(
+        [np.mean(dice_wt), np.mean(dice_tc), np.mean(dice_et)]))
+
     metrics = {
-        "loss": total_loss / len(loader),
+        "loss":      total_loss / len(loader),
         "dice_wt":   float(np.mean(dice_wt)),
         "dice_tc":   float(np.mean(dice_tc)),
         "dice_et":   float(np.mean(dice_et)),
@@ -209,72 +225,80 @@ def validate(model, loader, criterion, device, use_tta=True, epoch_label=""):
     return metrics
 
 
-def _save_best(model, optimizer, scaler, scheduler,
-               epoch, phase, best_dice, ema_dice,
-               val_metrics, ckpt_dir):
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def save_best(model, optimizer, scaler, scheduler,
+              epoch, phase, best_dice, val_metrics, ckpt_dir):
     save_checkpoint({
-        "epoch": epoch, "phase": phase,
-        "model": model.state_dict(),
+        "epoch":     epoch,
+        "phase":     phase,
+        "model":     model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "best_dice": best_dice, "ema_dice": ema_dice,
-        "dice_wt": val_metrics["dice_wt"],
-        "dice_tc": val_metrics["dice_tc"],
-        "dice_et": val_metrics["dice_et"],
+        "best_dice": best_dice,       # single val Dice — standard practice
+        "dice_wt":   val_metrics["dice_wt"],
+        "dice_tc":   val_metrics["dice_tc"],
+        "dice_et":   val_metrics["dice_et"],
     }, ckpt_dir / "best_model.pth")
 
 
-def _save_periodic(model, optimizer, scaler, scheduler,
-                   epoch, phase, best_dice, ema_dice,
-                   ckpt_dir, prefix):
+def save_periodic(model, optimizer, scaler, scheduler,
+                  epoch, phase, best_dice, ckpt_dir, prefix):
     save_checkpoint({
-        "epoch": epoch, "phase": phase,
-        "model": model.state_dict(),
+        "epoch":     epoch,
+        "phase":     phase,
+        "model":     model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "best_dice": best_dice, "ema_dice": ema_dice,
+        "best_dice": best_dice,
     }, ckpt_dir / f"{prefix}_epoch_{epoch+1:03d}.pth")
 
 
+# ── Joint training (single-phase, no freeze) ──────────────────────────────────
+
 def run_joint_training(model, cfg, train_loader, val_loader,
                        criterion, scaler, device, resume_path=None):
-    """Single-phase: encoder + decoder trained together, differential LR."""
+    """
+    All layers trained together from epoch 1.
+    Encoder gets 10x lower LR than decoder — differential LR replaces hard freeze.
+    Best model saved on single val Dice (standard research practice).
+    """
     total_epochs = (cfg["training"]["phase1_epochs"] +
                     cfg["training"]["phase2_epochs"])
-    p1_lr  = float(cfg["training"]["phase1_lr"])
-    p2_lr  = float(cfg["training"]["phase2_lr"])
-    ckpt_dir = Path(cfg["training"]["checkpoint_dir"])
-    log_every = cfg["logging"]["log_every"]
-    use_amp   = cfg["training"]["amp"]
-    save_every = cfg["training"]["save_every"]
-    patience  = cfg["training"].get("early_stop_patience", 15)
+    p1_lr        = float(cfg["training"]["phase1_lr"])
+    p2_lr        = float(cfg["training"]["phase2_lr"])
+    ckpt_dir     = Path(cfg["training"]["checkpoint_dir"])
+    log_every    = cfg["logging"]["log_every"]
+    use_amp      = cfg["training"]["amp"]
+    save_every   = cfg["training"]["save_every"]
+    patience     = cfg["training"].get("early_stop_patience", 15)
 
     model.unfreeze_all()
     param_groups = model.get_parameter_groups(p1_lr, p2_lr)
     optimizer = torch.optim.AdamW(
-        param_groups, weight_decay=float(cfg["training"]["weight_decay"]))
+        param_groups,
+        weight_decay=float(cfg["training"]["weight_decay"]))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=cfg["training"].get("cosine_T0", 20),
         T_mult=cfg["training"].get("cosine_Tmult", 2),
         eta_min=1e-7)
 
-    best_dice = -1.0
-    ema_dice  = -1.0
-    ema_alpha = 0.3
+    best_dice   = -1.0
     start_epoch = 0
     no_improve  = 0
 
     if resume_path and Path(resume_path).exists():
-        start_epoch, _, best_dice, ema_dice = load_checkpoint(
+        start_epoch, _, best_dice = load_checkpoint(
             resume_path, model, optimizer, scaler, scheduler, device)
 
     print("\n" + "="*60)
-    print(f"JOINT TRAINING -- all layers, differential LR")
-    print(f"  Encoder LR: {p2_lr*0.1:.2e} | Decoder LR: {p2_lr:.2e}")
+    print("JOINT TRAINING -- all layers, differential LR")
+    print(f"  Encoder LR : {p2_lr*0.1:.2e} | Decoder LR: {p2_lr:.2e}")
     print(f"  Total epochs: {total_epochs} | Early stop patience: {patience}")
+    print(f"  Best model: saved on single val mean Dice (standard)")
     print("="*60)
 
     for epoch in range(start_epoch, total_epochs):
@@ -286,11 +310,13 @@ def run_joint_training(model, cfg, train_loader, val_loader,
             scaler, device, log_every, use_amp, epoch_label=label)
 
         val_metrics = validate(
-            model, val_loader, criterion, device, use_tta=True, epoch_label=label)
+            model, val_loader, criterion, device,
+            use_tta=True, epoch_label=label)
 
         scheduler.step()
 
-        print(f"  Train -- " + " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
+        print(f"  Train -- " +
+              " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
         print(f"  Val   -- WT: {val_metrics['dice_wt']:.4f} | "
               f"TC: {val_metrics['dice_tc']:.4f} | "
               f"ET: {val_metrics['dice_et']:.4f} | "
@@ -299,37 +325,44 @@ def run_joint_training(model, cfg, train_loader, val_loader,
             print(f"  HD95  -- WT: {val_metrics['hd95_wt']:.2f} | "
                   f"TC: {val_metrics['hd95_tc']:.2f} | "
                   f"ET: {val_metrics['hd95_et']:.2f}")
+        print(f"  LR (decoder): {optimizer.param_groups[1]['lr']:.2e}")
 
+        # Save best on single val Dice — standard research approach
         curr_dice = val_metrics["dice_mean"]
-        ema_dice  = curr_dice if ema_dice < 0 else (ema_alpha * curr_dice + (1-ema_alpha) * ema_dice)
-        print(f"  EMA Dice: {ema_dice:.4f} | Best: {best_dice:.4f} | "
-              f"LR: {optimizer.param_groups[1]['lr']:.2e}")
-
-        if ema_dice > best_dice:
-            best_dice  = ema_dice
+        if curr_dice > best_dice:
+            best_dice  = curr_dice
             no_improve = 0
-            _save_best(model, optimizer, scaler, scheduler,
-                       epoch, 2, best_dice, ema_dice, val_metrics, ckpt_dir)
-            print(f"  New best EMA Dice: {best_dice:.4f}")
+            save_best(model, optimizer, scaler, scheduler,
+                      epoch, 2, best_dice, val_metrics, ckpt_dir)
+            print(f"  New best Dice: {best_dice:.4f}")
         else:
             no_improve += 1
-            print(f"  No improvement for {no_improve}/{patience} epochs")
+            print(f"  No improvement for {no_improve}/{patience} epochs "
+                  f"(best: {best_dice:.4f})")
 
         if (epoch + 1) % save_every == 0:
-            _save_periodic(model, optimizer, scaler, scheduler,
-                           epoch, 2, best_dice, ema_dice, ckpt_dir, "joint")
+            save_periodic(model, optimizer, scaler, scheduler,
+                          epoch, 2, best_dice, ckpt_dir, "joint")
 
         if no_improve >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1}")
+            print(f"\nEarly stopping at epoch {epoch+1} "
+                  f"(no improvement for {patience} epochs)")
             break
 
-    print(f"\nJoint training complete. Best EMA Dice: {best_dice:.4f}")
+    print(f"\nJoint training complete. Best val Dice: {best_dice:.4f}")
     return best_dice
 
 
+# ── Two-phase training ────────────────────────────────────────────────────────
+
 def run_two_phase_training(model, cfg, train_loader, val_loader,
                            criterion, scaler, device, resume_path=None):
-    """Original two-phase training."""
+    """
+    Original two-phase training.
+    Phase 1: encoder frozen, decoder warms up.
+    Phase 2: all layers unfrozen, differential LR.
+    Best model saved on single val Dice — standard research practice.
+    """
     p1_epochs  = cfg["training"]["phase1_epochs"]
     p1_lr      = float(cfg["training"]["phase1_lr"])
     p2_epochs  = cfg["training"]["phase2_epochs"]
@@ -339,13 +372,12 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
     use_amp    = cfg["training"]["amp"]
     save_every = cfg["training"]["save_every"]
     patience   = cfg["training"].get("early_stop_patience", 15)
-    ema_alpha  = 0.3
 
     best_dice    = -1.0
-    ema_dice     = -1.0
     resume_phase = 1
     resume_epoch = 0
 
+    # ── Phase 1 setup ──────────────────────────────────────────────────────
     model.freeze_encoder()
     p1_optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -354,12 +386,14 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
         p1_optimizer, T_0=10, T_mult=1, eta_min=1e-7)
 
     if resume_path and Path(resume_path).exists():
-        resume_epoch, resume_phase, best_dice, ema_dice = load_checkpoint(
+        resume_epoch, resume_phase, best_dice = load_checkpoint(
             resume_path, model, p1_optimizer, scaler, p1_scheduler, device)
 
+    # ── Phase 1 ────────────────────────────────────────────────────────────
     if resume_phase == 1:
         print("\n" + "="*60)
         print("PHASE 1 -- Decoder warmup (encoder frozen)")
+        print(f"  Best model: saved on single val mean Dice (standard)")
         print("="*60)
         no_improve = 0
 
@@ -371,35 +405,38 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
                 model, train_loader, criterion, p1_optimizer,
                 scaler, device, log_every, use_amp, epoch_label=label)
             val_metrics = validate(
-                model, val_loader, criterion, device, use_tta=True, epoch_label=label)
+                model, val_loader, criterion, device,
+                use_tta=True, epoch_label=label)
             p1_scheduler.step()
 
-            print(f"  Train -- " + " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
+            print(f"  Train -- " +
+                  " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
             print(f"  Val   -- WT: {val_metrics['dice_wt']:.4f} | "
                   f"TC: {val_metrics['dice_tc']:.4f} | "
                   f"ET: {val_metrics['dice_et']:.4f} | "
                   f"Mean: {val_metrics['dice_mean']:.4f}")
 
             curr_dice = val_metrics["dice_mean"]
-            ema_dice  = curr_dice if ema_dice < 0 else (ema_alpha * curr_dice + (1-ema_alpha) * ema_dice)
-
-            if ema_dice > best_dice:
-                best_dice  = ema_dice
+            if curr_dice > best_dice:
+                best_dice  = curr_dice
                 no_improve = 0
-                _save_best(model, p1_optimizer, scaler, p1_scheduler,
-                           epoch, 1, best_dice, ema_dice, val_metrics, ckpt_dir)
-                print(f"  New best EMA Dice: {best_dice:.4f}")
+                save_best(model, p1_optimizer, scaler, p1_scheduler,
+                          epoch, 1, best_dice, val_metrics, ckpt_dir)
+                print(f"  New best Dice: {best_dice:.4f}")
             else:
                 no_improve += 1
+                print(f"  No improvement for {no_improve}/{patience} epochs")
 
             if (epoch + 1) % save_every == 0:
-                _save_periodic(model, p1_optimizer, scaler, p1_scheduler,
-                               epoch, 1, best_dice, ema_dice, ckpt_dir, "phase1")
+                save_periodic(model, p1_optimizer, scaler, p1_scheduler,
+                              epoch, 1, best_dice, ckpt_dir, "phase1")
 
         resume_epoch = 0
 
+    # ── Phase 2 ────────────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("PHASE 2 -- Full fine-tuning (all layers unfrozen)")
+    print(f"  Best model: saved on single val mean Dice (standard)")
     print("="*60)
 
     model.unfreeze_all()
@@ -413,7 +450,7 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
         eta_min=1e-7)
 
     if resume_phase == 2 and resume_path and Path(resume_path).exists():
-        _, _, best_dice, ema_dice = load_checkpoint(
+        _, _, best_dice = load_checkpoint(
             resume_path, model, p2_optimizer, scaler, p2_scheduler, device)
 
     no_improve = 0
@@ -426,10 +463,12 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
             model, train_loader, criterion, p2_optimizer,
             scaler, device, log_every, use_amp, epoch_label=label)
         val_metrics = validate(
-            model, val_loader, criterion, device, use_tta=True, epoch_label=label)
+            model, val_loader, criterion, device,
+            use_tta=True, epoch_label=label)
         p2_scheduler.step()
 
-        print(f"  Train -- " + " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
+        print(f"  Train -- " +
+              " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
         print(f"  Val   -- WT: {val_metrics['dice_wt']:.4f} | "
               f"TC: {val_metrics['dice_tc']:.4f} | "
               f"ET: {val_metrics['dice_et']:.4f} | "
@@ -438,32 +477,33 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
             print(f"  HD95  -- WT: {val_metrics['hd95_wt']:.2f} | "
                   f"TC: {val_metrics['hd95_tc']:.2f} | "
                   f"ET: {val_metrics['hd95_et']:.2f}")
+        print(f"  LR (decoder): {p2_optimizer.param_groups[1]['lr']:.2e}")
 
         curr_dice = val_metrics["dice_mean"]
-        ema_dice  = curr_dice if ema_dice < 0 else (ema_alpha * curr_dice + (1-ema_alpha) * ema_dice)
-        print(f"  EMA Dice: {ema_dice:.4f} | Best: {best_dice:.4f}")
-
-        if ema_dice > best_dice:
-            best_dice  = ema_dice
+        if curr_dice > best_dice:
+            best_dice  = curr_dice
             no_improve = 0
-            _save_best(model, p2_optimizer, scaler, p2_scheduler,
-                       epoch, 2, best_dice, ema_dice, val_metrics, ckpt_dir)
-            print(f"  New best EMA Dice: {best_dice:.4f}")
+            save_best(model, p2_optimizer, scaler, p2_scheduler,
+                      epoch, 2, best_dice, val_metrics, ckpt_dir)
+            print(f"  New best Dice: {best_dice:.4f}")
         else:
             no_improve += 1
-            print(f"  No improvement for {no_improve}/{patience} epochs")
+            print(f"  No improvement for {no_improve}/{patience} epochs "
+                  f"(best: {best_dice:.4f})")
 
         if (epoch + 1) % save_every == 0:
-            _save_periodic(model, p2_optimizer, scaler, p2_scheduler,
-                           epoch, 2, best_dice, ema_dice, ckpt_dir, "phase2")
+            save_periodic(model, p2_optimizer, scaler, p2_scheduler,
+                          epoch, 2, best_dice, ckpt_dir, "phase2")
 
         if no_improve >= patience:
             print(f"\nEarly stopping at epoch {epoch+1}")
             break
 
-    print(f"\nTraining complete. Best EMA Dice: {best_dice:.4f}")
+    print(f"\nTraining complete. Best val Dice: {best_dice:.4f}")
     return best_dice
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(cfg_path, resume_path=None, joint=False):
     with open(cfg_path) as f:
@@ -472,7 +512,7 @@ def main(cfg_path, resume_path=None, joint=False):
     set_seed(cfg["training"]["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Mode  : {'JOINT (single-phase)' if joint else 'TWO-PHASE'}")
+    print(f"Mode  : {'JOINT (single-phase, no freeze)' if joint else 'TWO-PHASE'}")
 
     train_loader, val_loader = get_finetune_loaders(
         slices_dir  = cfg["data"]["output_slices"],
@@ -502,8 +542,9 @@ def main(cfg_path, resume_path=None, joint=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="../configs/finetune_config.yaml")
-    parser.add_argument("--resume", default=None)
+    parser.add_argument("--resume", default=None,
+                        help="Path to checkpoint to resume from.")
     parser.add_argument("--joint", action="store_true",
-                        help="Joint single-phase training (recommended for pretrained encoder)")
+                        help="Joint single-phase training (no encoder freeze).")
     args = parser.parse_args()
     main(args.config, args.resume, args.joint)
