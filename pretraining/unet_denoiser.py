@@ -7,7 +7,9 @@ Architecture (closely following paper Section 3.2):
   • Feature extractor G_φ  : 3 group-conv layers, 21 channels each
   • Encoder                : 2 blocks, each = 5 × (3×3 conv + GroupNorm + GELU)
   • Decoder                : 3 blocks with skip connections
-  • Output heads           : 1×1 convs → 4 channels (one per modality)
+  • Output heads           : 3 × 1×1 convs → 348, 96, then C channels
+                             (paper Sec 3.2: "three 1x1 convolution layers
+                             with 348, 96, and C filters, respectively")
 
 Input  : (B, N×C_mod, H, W)  — N slices concatenated along channel axis
           after STS sampling
@@ -176,9 +178,17 @@ class UNetDenoiser(nn.Module):
         self.dec1 = DecoderBlock(base_ch,     unet_in,
                                  base_ch // 2, gn_groups)
 
-        # ── Output heads (1×1 convs, paper uses 3 layers: 348, 96, C) ──
+        # ── Output heads ──
+        # Paper Sec 3.2: "three 1x1 convolution layers with 348, 96, and C
+        # filters, respectively, progressively reducing the number of
+        # channels to match the input image dimension."
+        # NOTE: the previous version of this file only had two 1x1 conv
+        # layers (96 -> out_channels), silently dropping the first
+        # (348-channel) layer the paper specifies. Restored below.
         self.head = nn.Sequential(
-            nn.Conv2d(base_ch // 2, 96,          1),
+            nn.Conv2d(base_ch // 2, 348,         1),
+            nn.GELU(),
+            nn.Conv2d(348,          96,          1),
             nn.GELU(),
             nn.Conv2d(96,           out_channels, 1),
             nn.Sigmoid()    # output in [0, 1] — matches normalised input

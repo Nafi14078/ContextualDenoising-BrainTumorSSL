@@ -11,10 +11,33 @@ The DataLoader collates these into (B, N, 4, H, W).
 The STS module then uses slice index as the "temporal" axis.
 
 Augmentation (train only):
-  - Random crop to patch_size × patch_size
-  - Random horizontal flip
-  - Random 90° rotation
+  - Crop to patch_size × patch_size
+  - Horizontal flip
+  - 90° rotation
   - Gaussian noise jitter (simulate extra noise for pretraining signal)
+
+Deterministic vs. random augmentation
+──────────────────────────────────────
+Crop position, flip, and rotation are now DETERMINISTIC per sample index
+(seeded by `idx`), rather than re-randomized every epoch. This is required
+for the recurrent L1 reference (paper Section 4, see
+pretraining/reference_cache.py and train_pretrain.py): the reference for
+sample `idx` is "this same sample's denoised output from the previous
+epoch," which is only a meaningful comparison if "this same sample" refers
+to the same physical crop of the volume every epoch. If the crop moved
+around randomly epoch to epoch (as it did previously), the cached
+"previous epoch" output and the current epoch's output would be different
+spatial regions, and the L1 loss between them would be comparing unrelated
+pixels.
+
+Fixing the crop/flip/rotation per index still gives each of the ~47k
+training samples its own distinct (and still effectively "random", since
+it's derived from a hash of the index) crop — you lose only the
+epoch-to-epoch re-randomization of that one sample's crop, not diversity
+across the dataset. Gaussian noise jitter is intentionally still
+re-randomized every epoch: it doesn't affect spatial identity, so varying
+it doesn't break reference alignment, and it's useful to keep the noise
+distribution the network sees from becoming static.
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -52,7 +75,7 @@ class BraTS2021SliceWindowDataset(Dataset):
             slices_dir   : root dir produced by preprocess_brats2021.py
             split        : "train" or "val"
             N            : number of slices in each window (must be odd)
-            patch_size   : random crop size
+            patch_size   : crop size
             augment      : apply augmentation (train only)
             max_subjects : if set, randomly keep only this many subjects.
                            Speeds up training dramatically since SSL
@@ -222,11 +245,24 @@ class BraTS2021SliceWindowDataset(Dataset):
         arr   = np.load(self.slices_dir / fname)        # (4, H, W)
         return torch.from_numpy(arr).float()
 
-    def _random_crop_params(self, h: int, w: int):
-        """Compute a random crop box once and reuse for all slices in window."""
-        top  = random.randint(0, h - self.patch_size)
-        left = random.randint(0, w - self.patch_size)
-        return top, left
+    def _augment_params(self, idx: int, h: int, w: int):
+        """
+        Deterministic per-sample-index crop/flip/rotation.
+
+        Seeded by `idx` alone (a local `random.Random`, not the global
+        `random` module) so the same sample gets the same spatial
+        transform on every epoch — required for the recurrent reference
+        cache to compare aligned pixels across epochs (see module
+        docstring). Uses its own Random instance so it doesn't perturb
+        the global random stream used elsewhere (subject subsampling,
+        noise jitter).
+        """
+        rng  = random.Random(idx)
+        top  = rng.randint(0, h - self.patch_size)
+        left = rng.randint(0, w - self.patch_size)
+        hflip = rng.random() > 0.5
+        rot   = rng.randint(0, 3)
+        return top, left, hflip, rot
 
     def _apply_augment(self, window: torch.Tensor,
                        crop_top: int, crop_left: int,
@@ -257,6 +293,13 @@ class BraTS2021SliceWindowDataset(Dataset):
         This is the 'noisy input' for the denoiser — the target is the
         original window (acting as a pseudo-clean reference).
         σ sampled uniformly from [0.01, 0.05] each batch.
+
+        Intentionally still uses the global `random`/`torch` RNGs (i.e.
+        re-randomized every epoch) — unlike crop/flip/rotation, noise
+        jitter doesn't affect which pixels are being compared, so
+        varying it doesn't break the recurrent reference cache's
+        spatial alignment, and keeping it stochastic avoids the network
+        overfitting to one fixed noise realization per sample.
         """
         sigma = random.uniform(0.01, 0.05)
         noise = torch.randn_like(window) * sigma
@@ -277,12 +320,13 @@ class BraTS2021SliceWindowDataset(Dataset):
             slices.append(sl)
         window = torch.stack(slices, dim=0)   # (N, 4, H, W)
 
-        # Augmentation — same transform applied to all N slices
+        # Augmentation — same transform applied to all N slices.
+        # Crop/flip/rotation are deterministic per `idx` (see
+        # _augment_params docstring); this is what keeps the recurrent
+        # reference cache spatially aligned across epochs.
         if self.augment:
             H, W    = window.shape[2], window.shape[3]
-            top, left = self._random_crop_params(H, W)
-            hflip     = random.random() > 0.5
-            rot       = random.randint(0, 3)
+            top, left, hflip, rot = self._augment_params(idx, H, W)
             window    = self._apply_augment(window, top, left, hflip, rot)
         else:
             # Centre crop for validation
@@ -307,13 +351,15 @@ class BraTS2021SliceWindowDataset(Dataset):
             "central":  self.half,# index of central slice in the window
             "index":    idx       # STABLE identity of this (subject, slice)
                                    # pair — same value across every epoch,
-                                   # regardless of DataLoader shuffling.
-                                   # Used by ReferenceCache so the recurrent
-                                   # L1 reference correctly tracks "this
-                                   # exact slice's previous-epoch denoised
-                                   # output", matching the paper's design
-                                   # (Section 4), instead of "whatever
-                                   # happened to be at this batch position."
+                                   # regardless of DataLoader shuffling, AND
+                                   # (as of this version) mapped to a fixed
+                                   # crop/flip/rotation every epoch too.
+                                   # Consumed by
+                                   # pretraining.reference_cache.RecurrentReferenceCache
+                                   # in train_pretrain.py to implement the
+                                   # paper's Section 4 recurrent L1
+                                   # reference: I_ref_t <- previous epoch's
+                                   # denoised output for this exact sample.
         }
 
 

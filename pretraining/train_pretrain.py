@@ -4,12 +4,16 @@ pretraining/train_pretrain.py
 Self-supervised pretraining loop (STS-UVD on BraTS2021 slices).
 
 Key behaviours:
-  • L1 reference is the noisy central slice every epoch (no cross-epoch
-    recurrent caching — see note below for why this was removed)
+  • L1 reference is RECURRENT (paper Section 4): each sample's reference is
+    its own denoised output from the previous epoch, read from a disk-backed
+    RecurrentReferenceCache (see pretraining/reference_cache.py). On epoch 0,
+    or for any sample not yet cached, the reference falls back to the noisy
+    central slice — matching the paper's own bootstrap behaviour.
   • Training stops when slice-consistency loss L2 converges (< delta)
     OR max_epochs is reached
   • Encoder weights saved after training for transfer to Swin UNETR
-  • Resumable via --resume <checkpoint.pth>
+  • Resumable via --resume <checkpoint.pth> (the reference cache lives in
+    the same checkpoint_dir and is picked up automatically — see note below)
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -32,11 +36,12 @@ from tqdm import tqdm
 
 # Local imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pretraining.dataset      import get_pretrain_loaders
-from pretraining.sts_kernel   import STSModule
-from pretraining.unet_denoiser import UNetDenoiser
-from pretraining.losses        import PretrainLoss
-from evaluation.metrics        import compute_psnr, compute_ssim
+from pretraining.dataset          import get_pretrain_loaders
+from pretraining.sts_kernel       import STSModule
+from pretraining.unet_denoiser    import UNetDenoiser
+from pretraining.losses           import PretrainLoss
+from pretraining.reference_cache  import RecurrentReferenceCache
+from evaluation.metrics           import compute_psnr, compute_ssim
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -66,6 +71,13 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
                           checkpoint predates scheduler saving (older
                           checkpoints fall back to step-count fast-forward
                           in main())
+
+    NOTE: the recurrent reference cache is NOT part of this .pth checkpoint
+    — it lives as separate files (reference_cache.dat/.valid/.meta.json) in
+    checkpoint_dir. RecurrentReferenceCache picks up whatever was already
+    written there automatically the next time it's constructed with the
+    same path, so resuming "just works" as long as --resume points at a
+    checkpoint in the same checkpoint_dir the cache was created in.
     """
     print(f"\n[Resume] Loading checkpoint from {path}")
     ckpt = torch.load(path, map_location=device)
@@ -103,25 +115,6 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
     return start_epoch, best_psnr, scheduler_state
 
 
-# NOTE: The cross-epoch ReferenceCache mechanism described in earlier
-# versions of this file has been REMOVED. It stored one tensor per
-# unique training sample (47,115 of them at 576 KB each = ~26 GB),
-# growing unboundedly through an epoch with no eviction — causing the
-# RAM exhaustion seen on Kaggle. It also had a deeper correctness issue:
-# since train uses random crop augmentation every epoch, a cached
-# "previous epoch's denoised output" referred to a DIFFERENT spatial
-# crop than the current epoch's crop, so the comparison wasn't even
-# spatially aligned. The paper's recurrent reference design (Section 4)
-# was built for a single short video of a few hundred/thousand frames,
-# not a large multi-subject dataset with per-epoch random cropping —
-# it doesn't transfer cleanly at this scale.
-#
-# Reference for the L1 loss is now simply the noisy central slice every
-# epoch (matching what epoch 0 already did). The actual unsupervised
-# denoising signal still comes from the STS blind-spot kernel (S) and
-# temporal weighting (T), which are unaffected by this change.
-
-
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_one_epoch(model:       UNetDenoiser,
@@ -130,6 +123,7 @@ def train_one_epoch(model:       UNetDenoiser,
                     criterion:   PretrainLoss,
                     optimizer,
                     scaler:      GradScaler,
+                    ref_cache:   RecurrentReferenceCache,
                     epoch:       int,
                     max_epochs:  int,
                     device,
@@ -147,14 +141,22 @@ def train_one_epoch(model:       UNetDenoiser,
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs}", unit="batch")
 
     for step, batch in enumerate(pbar):
-        noisy   = batch["noisy"].to(device)    # (B, N, 4, H, W)
-        clean   = batch["clean"].to(device)    # (B, N, 4, H, W)
-        C_idx   = batch["central"][0].item()   # scalar (same for all in batch)
+        noisy      = batch["noisy"].to(device)    # (B, N, 4, H, W)
+        clean      = batch["clean"].to(device)    # (B, N, 4, H, W)
+        C_idx      = batch["central"][0].item()   # scalar (same for all in batch)
+        sample_idx = batch["index"]                # (B,) LongTensor, stays on CPU
 
-        # Reference for L1 loss — the noisy central slice itself.
-        # (No cross-epoch recurrent caching — see note above class removal.)
         noisy_central = noisy[:, C_idx]       # (B, 4, H, W)
-        reference     = noisy_central
+
+        # ── Recurrent L1 reference (paper Section 4) ──
+        # For each sample, use its own denoised output from the previous
+        # epoch if the cache has one; otherwise fall back to the noisy
+        # central slice (this is what makes epoch 0 correct, and also
+        # gracefully handles any sample the cache hasn't seen yet).
+        cached_vals, cached_valid = ref_cache.get_batch(sample_idx)
+        cached_vals  = cached_vals.to(device)
+        cached_valid = cached_valid.to(device)
+        reference = torch.where(cached_valid, cached_vals, noisy_central)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -182,6 +184,11 @@ def train_one_epoch(model:       UNetDenoiser,
         scaler.step(optimizer)
         scaler.update()
 
+        # ── Update the recurrent reference cache with THIS epoch's output ──
+        # Becomes next epoch's reference for these exact samples. Detached
+        # (no grad) — the cache only ever stores plain tensors on disk.
+        ref_cache.set_batch(sample_idx, denoised_central.detach())
+
         for k, v in loss_dict.items():
             running[k]      += v.item()
             epoch_totals[k] += v.item()
@@ -201,6 +208,9 @@ def train_one_epoch(model:       UNetDenoiser,
                       f"({pct:.1f}%) | "
                       + " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
             running = defaultdict(float)
+
+    tqdm.write(f"  [Epoch {epoch+1}] reference cache populated: "
+              f"{ref_cache.fraction_populated()*100:.1f}% of samples")
 
     return {k: v / len(loader) for k, v in epoch_totals.items()}
 
@@ -261,6 +271,9 @@ def validate(model:    UNetDenoiser,
             all_ssim.append(compute_ssim(c, d))
 
         dw       = _denoise_full_window(model, sampled, sts.T.N)
+        # Validation intentionally does NOT use the recurrent reference
+        # cache — it's evaluating generalization against pseudo-clean
+        # targets, not tracking the training-time recurrent objective.
         ld       = criterion(denoised, clean_central, dw)
         total_l1 += ld["l1"].item()
         total_l2 += ld["l2"].item()
@@ -327,6 +340,18 @@ def main(cfg_path: str, resume_path: str = None):
     delta      = cfg["training"]["delta"]
     ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
 
+    # ── Recurrent reference cache (paper Section 4) ──
+    # Disk-backed (float16 memmap), keyed by the dataset's stable per-sample
+    # `index`. Lives inside checkpoint_dir so --resume picks it up for free.
+    # See pretraining/reference_cache.py for the memory/alignment design
+    # notes, and pretraining/dataset.py for the deterministic-crop change
+    # this relies on.
+    ref_cache = RecurrentReferenceCache(
+        path        = ckpt_dir / "reference_cache",
+        num_samples = len(train_loader.dataset),
+        shape       = (4, cfg["data"]["patch_size"], cfg["data"]["patch_size"]),
+    )
+
     # ── Resume state (defaults for a fresh run) ──
     start_epoch     = 0
     best_psnr       = -1.0
@@ -371,7 +396,7 @@ def main(cfg_path: str, resume_path: str = None):
 
         train_metrics = train_one_epoch(
             model, sts, train_loader, criterion, optimizer,
-            scaler, epoch, max_epochs, device,
+            scaler, ref_cache, epoch, max_epochs, device,
             cfg["logging"]["log_every"], cfg["training"]["amp"])
 
         val_metrics = validate(
@@ -434,6 +459,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint (.pth) to resume from. "
                              "Restores model, sts, optimizer, scaler, "
-                             "scheduler, epoch, and best_psnr.")
+                             "scheduler, epoch, and best_psnr. The "
+                             "recurrent reference cache is resumed "
+                             "separately/automatically from checkpoint_dir.")
     args = parser.parse_args()
     main(args.config, args.resume)
