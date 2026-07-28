@@ -28,6 +28,7 @@ sts:
 model:
   in_channels:      4            # one per modality
   base_channels:    48
+  depth:            5            # U-Net depth (encoder blocks)
   group_norm_groups: 8
 
 training:
