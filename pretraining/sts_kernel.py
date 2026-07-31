@@ -13,6 +13,23 @@ Paper → MRI mapping:
 Two modules:
   WeightedTemporalKernel (𝒯) : slice-distance-based weighting
   WeightedSpatialKernel  (𝒮) : blind-spot pixel replacement (vectorized)
+
+Train vs. eval behaviour
+──────────────────────────
+WeightedSpatialKernel's blind-spot pixel replacement is a *stochastic*
+self-supervision mechanism — it exists purely to stop the network from
+learning a trivial identity mapping of noise during TRAINING. It has no
+business running during validation/inference: doing so means every
+validate() call corrupts a fresh random 10-20% of pixels with a new random
+seed each time, so val PSNR/SSIM measure "how good is the model at
+denoising a randomly-corrupted-slightly-differently-each-epoch input"
+rather than "how good is the model," making epoch-to-epoch PSNR
+comparisons noisy in a way that has nothing to do with actual model
+quality. Both kernels below check `self.training` (set by the standard
+`nn.Module.train()`/`.eval()` calls already used in train_pretrain.py) and
+skip their stochastic step when in eval mode, passing features straight
+through unmodified instead — matching how blind-spot denoising methods
+(e.g. Noise2Void-style) are conventionally evaluated.
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -95,6 +112,13 @@ class WeightedTemporalKernel(nn.Module):
 
     κ decays to 0 over training epochs, letting the network eventually
     ignore the central slice almost entirely during training.
+
+    NOTE ON EVAL: unlike WeightedSpatialKernel, this module has no
+    randomness — the weights are a deterministic function of
+    (epoch, max_epoch, dissimilarity). It's left running identically in
+    train and eval so validation still reflects the same slice-weighting
+    curriculum the model is currently at (this is a fixed, reproducible
+    computation, not a stochastic corruption of the input).
     """
 
     def __init__(self, N: int = 7, L: float = 1.0, eta: float = 0.0003):
@@ -183,7 +207,7 @@ class WeightedSpatialKernel(nn.Module):
     """
     Implements the blind-spot spatial sampling from the paper (Eq.6-7).
 
-    For each slice in the window:
+    For each slice in the window (TRAINING ONLY — see module docstring):
       1. Randomly select 10-20% of pixel positions {p}
       2. Replace each p with a neighbour q sampled from a 5×5 window,
          where probability favours pixels FARTHER from p (edge bias)
@@ -197,6 +221,13 @@ class WeightedSpatialKernel(nn.Module):
     which caused massive slowdowns (minutes per training step). This
     version processes all pixels across the whole batch in one shot
     using gather/scatter operations.
+
+    EVAL MODE: skips the stochastic replacement entirely and returns
+    `features` unmodified. Without this, every validate() call would
+    corrupt a freshly-randomized 10-20% of pixels with a new random draw
+    each epoch, making val PSNR/SSIM partly measure random-seed luck
+    rather than model quality — this was previously causing spurious
+    epoch-to-epoch PSNR swings unrelated to real model changes.
     """
 
     def __init__(self,
@@ -245,7 +276,17 @@ class WeightedSpatialKernel(nn.Module):
 
         features : (B, N, C, H, W)
         Returns  : (B, N, C, H, W) with blind-spot pixel replacement
+                   applied during training, or `features` unchanged
+                   during eval (see module/class docstrings).
         """
+        # ── Eval mode: no stochastic corruption, pass through unchanged ──
+        # This is what makes val PSNR/SSIM comparable epoch-to-epoch —
+        # otherwise every call here would apply a fresh random pixel
+        # replacement and val metrics would swing based on random-seed
+        # luck rather than actual model improvement.
+        if not self.training:
+            return features
+
         B, N, C, H, W = features.shape
         device = features.device
         BN     = B * N
@@ -293,6 +334,11 @@ class STSModule(nn.Module):
     """
     Combines 𝒯 and 𝒮 into one forward pass.
     Called once per training iteration before the denoiser.
+
+    `sts.train()` / `sts.eval()` (called by train_one_epoch / validate in
+    train_pretrain.py) propagate to both submodules automatically via
+    standard nn.Module behaviour — WeightedSpatialKernel uses this to skip
+    its stochastic pixel replacement during eval (see its docstring).
     """
 
     def __init__(self, N: int = 7, L: float = 1.0,
@@ -314,8 +360,8 @@ class STSModule(nn.Module):
         raw_window : (B, N, C_mod, H, W)   original noisy slices (for NCC)
         Returns    : (B, N, C_feat, H, W)  spatiotemporally sampled
         """
-        # Step 1: Temporal weighting (𝒯)
+        # Step 1: Temporal weighting (𝒯) — deterministic, runs in both modes
         x = self.T(features, raw_window, epoch, max_epoch)
-        # Step 2: Spatial blind-spot replacement (𝒮)
+        # Step 2: Spatial blind-spot replacement (𝒮) — training only
         x = self.S(x)
         return x
