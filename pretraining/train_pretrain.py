@@ -12,8 +12,41 @@ Key behaviours:
   • Training stops when slice-consistency loss L2 converges (< delta)
     OR max_epochs is reached
   • Encoder weights saved after training for transfer to Swin UNETR
-  • Resumable via --resume <checkpoint.pth> (the reference cache lives in
-    the same checkpoint_dir and is picked up automatically — see note below)
+  • Resumable via --resume <checkpoint.pth>
+  • Both training AND validation show a live tqdm progress bar (samples
+    done / total, % complete, running metrics).
+
+Reference cache <-> checkpoint pairing
+──────────────────────────────────────
+The reference cache is NOT stored inside the .pth file — it's a large
+(potentially multi-GB) disk-backed array, which doesn't belong in a
+checkpoint you might want to move around cheaply. Instead:
+
+  • The "live" cache — `reference_cache.*` in checkpoint_dir — is what the
+    current training run actually reads/writes every step. It always
+    reflects "whatever epoch this run most recently completed."
+  • Every time `best_model.pth` is saved, a matching snapshot of the cache
+    is copied to `reference_cache_best.*`, so that checkpoint stays a
+    self-contained, portable pair: (best_model.pth, reference_cache_best.*).
+    If you move/upload a checkpoint between sessions, move BOTH — and don't
+    cross-pair them (e.g. epoch_020.pth with reference_cache_best.*): the
+    epoch-mismatch check below will detect that and reset the cache rather
+    than use it incorrectly.
+  • A `.last_epoch` marker file records which epoch a given cache reflects.
+    On --resume, this is checked against the checkpoint's own epoch. If
+    they don't match, the mismatch is impossible to use safely — those
+    cached values were produced by different model weights than the ones
+    just loaded — so the cache is reset to the noisy-central-slice
+    bootstrap instead of silently feeding the model stale/mismatched
+    references. This is printed loudly, not silent.
+  • Periodic checkpoints (epoch_XXX.pth) do NOT get their own versioned
+    cache snapshot (that would mean a full cache copy — potentially many
+    GB — every `save_every` epochs, which is not worth the disk cost).
+    Resuming from one of these works correctly only if the live
+    `reference_cache.*` files in the same checkpoint_dir are still present
+    and still reflect that same epoch (i.e. you're resuming within the same
+    run/directory, not moving just the .pth elsewhere). If not, the
+    mismatch check below catches it and resets safely.
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -24,6 +57,7 @@ import os
 import sys
 import math
 import yaml
+import shutil
 import argparse
 import numpy as np
 from pathlib import Path
@@ -72,12 +106,8 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
                           checkpoints fall back to step-count fast-forward
                           in main())
 
-    NOTE: the recurrent reference cache is NOT part of this .pth checkpoint
-    — it lives as separate files (reference_cache.dat/.valid/.meta.json) in
-    checkpoint_dir. RecurrentReferenceCache picks up whatever was already
-    written there automatically the next time it's constructed with the
-    same path, so resuming "just works" as long as --resume points at a
-    checkpoint in the same checkpoint_dir the cache was created in.
+    NOTE: the recurrent reference cache is NOT part of this .pth file — see
+    the module docstring above for how it's paired with checkpoints instead.
     """
     print(f"\n[Resume] Loading checkpoint from {path}")
     ckpt = torch.load(path, map_location=device)
@@ -115,6 +145,56 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
     return start_epoch, best_psnr, scheduler_state
 
 
+# ── Reference-cache <-> checkpoint pairing helpers ──────────────────────────
+
+def _cache_files(base: Path):
+    """The set of files that make up one reference cache 'bundle'."""
+    return [
+        Path(str(base) + ".dat"),
+        Path(str(base) + ".valid"),
+        Path(str(base) + ".meta.json"),
+        Path(str(base) + ".last_epoch"),
+    ]
+
+
+def read_cache_last_epoch(base: Path):
+    """
+    Returns the epoch index (0-based) this cache bundle was last written
+    for, or None if no marker exists (cache missing / never written).
+    """
+    marker = Path(str(base) + ".last_epoch")
+    if marker.exists():
+        try:
+            return int(marker.read_text().strip())
+        except ValueError:
+            return None
+    return None
+
+
+def write_cache_last_epoch(base: Path, epoch: int):
+    Path(str(base) + ".last_epoch").write_text(str(epoch))
+
+
+def snapshot_reference_cache(src_base: Path, dst_base: Path):
+    """
+    Copy a full reference-cache bundle (.dat/.valid/.meta.json/.last_epoch)
+    from src_base to dst_base. Used to pair a cache snapshot with
+    best_model.pth so that pair can be moved/uploaded together.
+    """
+    for src in _cache_files(src_base):
+        if src.exists():
+            dst_name = dst_base.name + src.name[len(src_base.name):]
+            dst = src.parent / dst_name
+            shutil.copy2(src, dst)
+
+
+def reset_cache_files(base: Path):
+    """Delete a cache bundle so RecurrentReferenceCache recreates it fresh."""
+    for f in _cache_files(base):
+        if f.exists():
+            f.unlink()
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_one_epoch(model:       UNetDenoiser,
@@ -138,7 +218,7 @@ def train_one_epoch(model:       UNetDenoiser,
     batch_size    = loader.batch_size
     total_samples = len(loader.dataset)
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs}", unit="batch")
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs} [train]", unit="batch")
 
     for step, batch in enumerate(pbar):
         noisy      = batch["noisy"].to(device)    # (B, N, 4, H, W)
@@ -251,7 +331,12 @@ def validate(model:    UNetDenoiser,
     all_psnr, all_ssim = [], []
     total_l1, total_l2 = 0.0, 0.0
 
-    for batch in loader:
+    batch_size    = loader.batch_size
+    total_samples = len(loader.dataset)
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{max_epochs} [val]  ", unit="batch")
+
+    for step, batch in enumerate(pbar):
         noisy    = batch["noisy"].to(device)
         clean    = batch["clean"].to(device)
         C_idx    = batch["central"][0].item()
@@ -277,6 +362,18 @@ def validate(model:    UNetDenoiser,
         ld       = criterion(denoised, clean_central, dw)
         total_l1 += ld["l1"].item()
         total_l2 += ld["l2"].item()
+
+        # ── Live progress bar — updates every batch ──
+        samples_done   = min((step + 1) * batch_size, total_samples)
+        pct             = samples_done / total_samples * 100
+        running_psnr    = float(np.mean(all_psnr))
+        running_ssim    = float(np.mean(all_ssim))
+        pbar.set_postfix({
+            "samples": f"{samples_done}/{total_samples}",
+            "%":       f"{pct:.1f}",
+            "psnr":    f"{running_psnr:.2f}",
+            "ssim":    f"{running_ssim:.3f}",
+        })
 
     return {
         "psnr":  float(np.mean(all_psnr)),
@@ -340,31 +437,64 @@ def main(cfg_path: str, resume_path: str = None):
     delta      = cfg["training"]["delta"]
     ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
 
-    # ── Recurrent reference cache (paper Section 4) ──
-    # Disk-backed (float16 memmap), keyed by the dataset's stable per-sample
-    # `index`. Lives inside checkpoint_dir so --resume picks it up for free.
-    # See pretraining/reference_cache.py for the memory/alignment design
-    # notes, and pretraining/dataset.py for the deterministic-crop change
-    # this relies on.
-    ref_cache = RecurrentReferenceCache(
-        path        = ckpt_dir / "reference_cache",
-        num_samples = len(train_loader.dataset),
-        shape       = (4, cfg["data"]["patch_size"], cfg["data"]["patch_size"]),
-    )
+    live_cache_base = ckpt_dir / "reference_cache"
+    best_cache_base = ckpt_dir / "reference_cache_best"
 
     # ── Resume state (defaults for a fresh run) ──
     start_epoch     = 0
     best_psnr       = -1.0
     scheduler_state = None
+    # Which cache bundle THIS run will actually read/write. Defaults to the
+    # live one; switches to the "best" snapshot only if we're explicitly
+    # resuming from best_model.pth (see below).
+    cache_base = live_cache_base
 
     if resume_path:
         resume_path = Path(resume_path)
         if resume_path.exists():
+            is_best_resume = (resume_path.name == "best_model.pth")
+            cache_base = best_cache_base if is_best_resume else live_cache_base
+
             start_epoch, best_psnr, scheduler_state = load_checkpoint(
                 resume_path, model, sts, optimizer, scaler, device)
+            resumed_epoch = start_epoch - 1  # last epoch this checkpoint actually completed
+
+            cache_last_epoch = read_cache_last_epoch(cache_base)
+            if cache_last_epoch is None:
+                print(f"[Resume] No reference-cache bundle found at "
+                      f"'{cache_base.name}.*' — recurrent reference will "
+                      f"bootstrap from noisy central slices until each "
+                      f"sample is seen again this run.\n")
+            elif cache_last_epoch != resumed_epoch:
+                print(f"\n[WARN] Reference cache '{cache_base.name}' reflects "
+                      f"outputs from epoch {cache_last_epoch + 1}, but "
+                      f"'{resume_path.name}' finished epoch "
+                      f"{resumed_epoch + 1}. Those cached values were "
+                      f"produced by DIFFERENT model weights than the ones "
+                      f"just loaded — using them would silently feed the "
+                      f"model a mismatched reference. Resetting this cache; "
+                      f"the recurrent reference restarts from the "
+                      f"noisy-central-slice bootstrap for this run.\n")
+                reset_cache_files(cache_base)
+            else:
+                print(f"  ✓ Reference cache '{cache_base.name}' matches "
+                      f"checkpoint epoch ({resumed_epoch + 1}) — recurrent "
+                      f"reference resumes correctly.\n")
         else:
             print(f"[WARN] --resume path not found: {resume_path}")
             print("       Starting fresh from epoch 0 instead.")
+
+    # ── Recurrent reference cache (paper Section 4) ──
+    # Disk-backed (float16 memmap), keyed by the dataset's stable per-sample
+    # `index`. See pretraining/reference_cache.py for the memory/alignment
+    # design notes, and pretraining/dataset.py for the deterministic-crop
+    # change this relies on. See module docstring above for how this
+    # bundle is paired with checkpoints across sessions.
+    ref_cache = RecurrentReferenceCache(
+        path        = cache_base,
+        num_samples = len(train_loader.dataset),
+        shape       = (4, cfg["data"]["patch_size"], cfg["data"]["patch_size"]),
+    )
 
     # ── Scheduler — created fresh, then restored or fast-forwarded ──
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -399,6 +529,10 @@ def main(cfg_path: str, resume_path: str = None):
             scaler, ref_cache, epoch, max_epochs, device,
             cfg["logging"]["log_every"], cfg["training"]["amp"])
 
+        # Mark which epoch this cache bundle now reflects — checked against
+        # checkpoint epoch on any future --resume (see top of main()).
+        write_cache_last_epoch(cache_base, epoch)
+
         val_metrics = validate(
             model, sts, val_loader, criterion,
             epoch, max_epochs, device)
@@ -425,6 +559,17 @@ def main(cfg_path: str, resume_path: str = None):
                 "psnr":      best_psnr,
             }, ckpt_dir / "best_model.pth")
 
+            # Pair a matching reference-cache snapshot with this checkpoint
+            # so (best_model.pth, reference_cache_best.*) can be moved or
+            # uploaded together and resumed correctly in a fresh session.
+            # Skipped if we're already operating directly on the "best"
+            # cache bundle (i.e. this run itself resumed from best_model.pth
+            # and never diverged onto a separate live cache).
+            if cache_base.resolve() != best_cache_base.resolve():
+                snapshot_reference_cache(cache_base, best_cache_base)
+                print(f"  ✓ Reference cache snapshot saved → "
+                      f"{best_cache_base}.*")
+
         # Periodic checkpoint
         if (epoch + 1) % cfg["training"]["save_every"] == 0:
             save_checkpoint({
@@ -436,6 +581,11 @@ def main(cfg_path: str, resume_path: str = None):
                 "scheduler": scheduler.state_dict(),
                 "psnr":      best_psnr,
             }, ckpt_dir / f"epoch_{epoch+1:03d}.pth")
+            # NOTE: periodic checkpoints intentionally do NOT get their own
+            # versioned cache snapshot (see module docstring) — resuming
+            # from one relies on the live cache still being present in the
+            # same checkpoint_dir, which the epoch-mismatch check above
+            # verifies and safely falls back from if not.
 
         # Convergence check on L2 (paper stops when L2 < delta)
         curr_l2 = val_metrics["l2"]
@@ -459,8 +609,13 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint (.pth) to resume from. "
                              "Restores model, sts, optimizer, scaler, "
-                             "scheduler, epoch, and best_psnr. The "
-                             "recurrent reference cache is resumed "
-                             "separately/automatically from checkpoint_dir.")
+                             "scheduler, epoch, and best_psnr. If resuming "
+                             "from best_model.pth, its paired "
+                             "reference_cache_best.* bundle is used and "
+                             "checked for epoch-consistency; otherwise the "
+                             "live reference_cache.* in checkpoint_dir is "
+                             "used. A mismatch or missing cache resets to "
+                             "the noisy-central-slice bootstrap rather than "
+                             "silently using stale/mismatched values.")
     args = parser.parse_args()
     main(args.config, args.resume)
