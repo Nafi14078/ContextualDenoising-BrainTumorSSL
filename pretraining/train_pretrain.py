@@ -15,6 +15,9 @@ Key behaviours:
   • Resumable via --resume <checkpoint.pth>
   • Both training AND validation show a live tqdm progress bar (samples
     done / total, % complete, running metrics).
+  • WeightedSpatialKernel's stochastic blind-spot replacement is disabled
+    during validation (see sts_kernel.py) so val PSNR/SSIM aren't corrupted
+    by a fresh random pixel-replacement draw every epoch.
 
 Reference cache <-> checkpoint pairing
 ──────────────────────────────────────
@@ -24,29 +27,46 @@ checkpoint you might want to move around cheaply. Instead:
 
   • The "live" cache — `reference_cache.*` in checkpoint_dir — is what the
     current training run actually reads/writes every step. It always
-    reflects "whatever epoch this run most recently completed."
-  • Every time `best_model.pth` is saved, a matching snapshot of the cache
-    is copied to `reference_cache_best.*`, so that checkpoint stays a
-    self-contained, portable pair: (best_model.pth, reference_cache_best.*).
-    If you move/upload a checkpoint between sessions, move BOTH — and don't
-    cross-pair them (e.g. epoch_020.pth with reference_cache_best.*): the
-    epoch-mismatch check below will detect that and reset the cache rather
-    than use it incorrectly.
-  • A `.last_epoch` marker file records which epoch a given cache reflects.
-    On --resume, this is checked against the checkpoint's own epoch. If
-    they don't match, the mismatch is impossible to use safely — those
-    cached values were produced by different model weights than the ones
-    just loaded — so the cache is reset to the noisy-central-slice
+    reflects "whatever epoch this run most recently completed." Its full
+    size is allocated up front (not grown incrementally), so budget for it:
+    roughly num_train_samples × 4 × patch_size² × 2 bytes (float16). E.g.
+    ~20,900 samples at patch_size=192 ≈ 6.1GB.
+  • A `.last_epoch` marker file records which epoch the live cache
+    reflects. On --resume, this is checked against the checkpoint's own
+    epoch. If they don't match, the mismatch is impossible to use safely —
+    those cached values were produced by different model weights than the
+    ones just loaded — so the cache is reset to the noisy-central-slice
     bootstrap instead of silently feeding the model stale/mismatched
     references. This is printed loudly, not silent.
-  • Periodic checkpoints (epoch_XXX.pth) do NOT get their own versioned
-    cache snapshot (that would mean a full cache copy — potentially many
-    GB — every `save_every` epochs, which is not worth the disk cost).
-    Resuming from one of these works correctly only if the live
-    `reference_cache.*` files in the same checkpoint_dir are still present
-    and still reflect that same epoch (i.e. you're resuming within the same
-    run/directory, not moving just the .pth elsewhere). If not, the
-    mismatch check below catches it and resets safely.
+
+  Optional best-checkpoint cache snapshot (cfg["training"]["snapshot_best_cache"])
+  ─────────────────────────────────────────────────────────────────────────────
+  DEFAULT: OFF. When ON, every time `best_model.pth` is (re)saved, the live
+  cache is also copied to `reference_cache_best.*`, pairing that checkpoint
+  with its own matching cache snapshot so (best_model.pth,
+  reference_cache_best.*) can be moved/uploaded together and resumed with
+  full recurrent-reference fidelity in a fresh session.
+
+  This is now opt-in because it DOUBLES the cache's disk footprint locally
+  (live + best, each full-size — e.g. ~6.1GB becomes ~12.2GB) and, on a
+  quota-constrained environment like Kaggle's default 19GiB /kaggle/working,
+  this alone was enough to exhaust the quota within the first couple of
+  epochs, since best_model.pth is typically re-saved on nearly every early
+  epoch as PSNR improves. If you're not planning to upload/move the cache
+  between sessions anyway, leave this OFF — you still get full recurrent-
+  reference behaviour *within* the current run via the live cache; you only
+  lose the ability to resume with cache fidelity from a `best_model.pth`
+  that isn't also the most recent live epoch (see main() for exact resume
+  behaviour in that case — it safely falls back to the noisy bootstrap
+  rather than doing anything incorrect).
+
+  Periodic checkpoints (epoch_XXX.pth) never get their own versioned cache
+  snapshot regardless of this flag (would mean a full cache copy every
+  `save_every` epochs — not worth the disk cost even with the flag on).
+  Resuming from one of these works correctly only if the live
+  `reference_cache.*` files in the same checkpoint_dir are still present
+  and still reflect that same epoch. If not, the mismatch check below
+  catches it and resets safely.
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -180,6 +200,10 @@ def snapshot_reference_cache(src_base: Path, dst_base: Path):
     Copy a full reference-cache bundle (.dat/.valid/.meta.json/.last_epoch)
     from src_base to dst_base. Used to pair a cache snapshot with
     best_model.pth so that pair can be moved/uploaded together.
+
+    NOTE: this duplicates the full cache file size on disk (see
+    cfg["training"]["snapshot_best_cache"] docs at the top of this file) —
+    only called when that flag is explicitly enabled.
     """
     for src in _cache_files(src_base):
         if src.exists():
@@ -437,6 +461,11 @@ def main(cfg_path: str, resume_path: str = None):
     delta      = cfg["training"]["delta"]
     ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
 
+    # Opt-in only — see module docstring for why this defaults to False
+    # (doubles the cache's disk footprint; was exhausting Kaggle's 19GiB
+    # /kaggle/working quota within the first couple of epochs).
+    snapshot_best_cache = bool(cfg["training"].get("snapshot_best_cache", False))
+
     live_cache_base = ckpt_dir / "reference_cache"
     best_cache_base = ckpt_dir / "reference_cache_best"
 
@@ -464,7 +493,11 @@ def main(cfg_path: str, resume_path: str = None):
                 print(f"[Resume] No reference-cache bundle found at "
                       f"'{cache_base.name}.*' — recurrent reference will "
                       f"bootstrap from noisy central slices until each "
-                      f"sample is seen again this run.\n")
+                      f"sample is seen again this run. (Expected if "
+                      f"snapshot_best_cache was off, or if you didn't "
+                      f"upload the cache files — this is safe, just less "
+                      f"faithful to the paper's Section 4 design for a "
+                      f"few epochs.)\n")
             elif cache_last_epoch != resumed_epoch:
                 print(f"\n[WARN] Reference cache '{cache_base.name}' reflects "
                       f"outputs from epoch {cache_last_epoch + 1}, but "
@@ -489,12 +522,19 @@ def main(cfg_path: str, resume_path: str = None):
     # `index`. See pretraining/reference_cache.py for the memory/alignment
     # design notes, and pretraining/dataset.py for the deterministic-crop
     # change this relies on. See module docstring above for how this
-    # bundle is paired with checkpoints across sessions.
+    # bundle is paired with checkpoints across sessions, and for the
+    # snapshot_best_cache disk-usage tradeoff.
     ref_cache = RecurrentReferenceCache(
         path        = cache_base,
         num_samples = len(train_loader.dataset),
         shape       = (4, cfg["data"]["patch_size"], cfg["data"]["patch_size"]),
     )
+
+    approx_gb = (len(train_loader.dataset) * 4 *
+                cfg["data"]["patch_size"] * cfg["data"]["patch_size"] * 2) / 1e9
+    print(f"[Cache] Live reference cache allocated (~{approx_gb:.1f} GB on disk).")
+    print(f"[Cache] snapshot_best_cache = {snapshot_best_cache} "
+          f"({'will duplicate this on every best-checkpoint save' if snapshot_best_cache else 'best-checkpoint cache snapshot disabled — saves disk'})")
 
     # ── Scheduler — created fresh, then restored or fast-forwarded ──
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -562,10 +602,13 @@ def main(cfg_path: str, resume_path: str = None):
             # Pair a matching reference-cache snapshot with this checkpoint
             # so (best_model.pth, reference_cache_best.*) can be moved or
             # uploaded together and resumed correctly in a fresh session.
-            # Skipped if we're already operating directly on the "best"
-            # cache bundle (i.e. this run itself resumed from best_model.pth
-            # and never diverged onto a separate live cache).
-            if cache_base.resolve() != best_cache_base.resolve():
+            # OPT-IN (see snapshot_best_cache docs above) — duplicates the
+            # full cache file size on disk every time this fires, which can
+            # be nearly every early epoch as PSNR improves. Skipped if
+            # we're already operating directly on the "best" cache bundle
+            # (i.e. this run itself resumed from best_model.pth and never
+            # diverged onto a separate live cache).
+            if snapshot_best_cache and cache_base.resolve() != best_cache_base.resolve():
                 snapshot_reference_cache(cache_base, best_cache_base)
                 print(f"  ✓ Reference cache snapshot saved → "
                       f"{best_cache_base}.*")
@@ -581,11 +624,12 @@ def main(cfg_path: str, resume_path: str = None):
                 "scheduler": scheduler.state_dict(),
                 "psnr":      best_psnr,
             }, ckpt_dir / f"epoch_{epoch+1:03d}.pth")
-            # NOTE: periodic checkpoints intentionally do NOT get their own
-            # versioned cache snapshot (see module docstring) — resuming
-            # from one relies on the live cache still being present in the
-            # same checkpoint_dir, which the epoch-mismatch check above
-            # verifies and safely falls back from if not.
+            # NOTE: periodic checkpoints never get their own versioned cache
+            # snapshot regardless of snapshot_best_cache (see module
+            # docstring) — resuming from one relies on the live cache still
+            # being present in the same checkpoint_dir, which the
+            # epoch-mismatch check above verifies and safely falls back
+            # from if not.
 
         # Convergence check on L2 (paper stops when L2 < delta)
         curr_l2 = val_metrics["l2"]
@@ -610,7 +654,9 @@ if __name__ == "__main__":
                         help="Path to a checkpoint (.pth) to resume from. "
                              "Restores model, sts, optimizer, scaler, "
                              "scheduler, epoch, and best_psnr. If resuming "
-                             "from best_model.pth, its paired "
+                             "from best_model.pth AND "
+                             "cfg.training.snapshot_best_cache was enabled "
+                             "on the run that produced it, its paired "
                              "reference_cache_best.* bundle is used and "
                              "checked for epoch-consistency; otherwise the "
                              "live reference_cache.* in checkpoint_dir is "
