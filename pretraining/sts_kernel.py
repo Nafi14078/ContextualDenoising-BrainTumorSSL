@@ -210,10 +210,26 @@ class WeightedSpatialKernel(nn.Module):
     For each slice in the window (TRAINING ONLY — see module docstring):
       1. Randomly select 10-20% of pixel positions {p}
       2. Replace each p with a neighbour q sampled from a 5×5 window,
-         where probability favours pixels FARTHER from p (edge bias)
+         with probability P(q|p) ∝ e^{-α·d(p,q)} (paper Eq.7) — this
+         DECREASES with L1 distance, so NEARER neighbours are more likely
+         to be chosen than farther ones.
 
     This breaks the spatial self-correlation that would let the network
     learn a trivial identity mapping of noise.
+
+    Direction of Eq.7 — resolved
+    ─────────────────────────────
+    An earlier version of this file used `+α·d` (favoring FARTHER pixels),
+    based on one sentence in the paper's prose ("prioritizes faraway
+    pixels"). On closer reading, that sentence contradicts both the
+    paper's own literal formula AND its own clarifying follow-up sentence
+    ("pixels closer to the edges (smaller d(p,q)) have a higher
+    probability of being chosen") — two out of three signals in the paper
+    agree the formula should favor NEARER pixels. This version now
+    implements that literal reading: `logits = -α · d(p,q)`, so probability
+    decreases as distance increases (a standard softmax-over-negative-
+    distance, i.e. nearer neighbours dominate, similar in spirit to how
+    e.g. bilateral filters weight nearby pixels more heavily).
 
     IMPORTANT: forward() is fully vectorized — no per-pixel Python loop,
     no .item() calls inside the loop, no GPU→CPU syncs. The original
@@ -226,8 +242,7 @@ class WeightedSpatialKernel(nn.Module):
     `features` unmodified. Without this, every validate() call would
     corrupt a freshly-randomized 10-20% of pixels with a new random draw
     each epoch, making val PSNR/SSIM partly measure random-seed luck
-    rather than model quality — this was previously causing spurious
-    epoch-to-epoch PSNR swings unrelated to real model changes.
+    rather than model quality.
     """
 
     def __init__(self,
@@ -238,7 +253,10 @@ class WeightedSpatialKernel(nn.Module):
         Args:
             replace_ratio : fraction of pixels to replace (0.10–0.20)
             window        : neighbourhood size (5×5)
-            alpha         : edge-emphasis factor (Eq.7, paper uses 3)
+            alpha         : distance-decay factor (Eq.7, paper uses 3).
+                            Larger alpha → probability falls off faster
+                            with distance → replacements drawn from even
+                            closer to p.
         """
         super().__init__()
         self.replace_ratio = replace_ratio
@@ -251,8 +269,11 @@ class WeightedSpatialKernel(nn.Module):
 
     def _build_prob_table(self):
         """
-        Eq.7: P(q|p) ∝ e^{-α · d(p,q)} — wait, note the paper INVERTS this
-        so that farther pixels have HIGHER probability. We use +α·d.
+        Eq.7: P(q|p) ∝ e^{-α · d(p,q)}, taken literally — probability
+        DECREASES with L1 distance d(p,q), so nearer neighbours in the
+        window are favoured over farther ones. (See class docstring for
+        why this replaces the earlier +α·d "favor farther pixels"
+        interpretation.)
         """
         half    = self.half
         offsets = []
@@ -265,8 +286,9 @@ class WeightedSpatialKernel(nn.Module):
                 dists.append(abs(dy) + abs(dx))   # L1 distance
 
         dists_t = torch.tensor(dists, dtype=torch.float32)
-        # Paper Eq.7: prefer FARTHER pixels → positive exponent of distance
-        logits  = self.alpha * dists_t
+        # Paper Eq.7, literal form: prefer NEARER pixels → negative
+        # exponent of distance (probability decays with distance).
+        logits  = -self.alpha * dists_t
         self.probs   = F.softmax(logits, dim=0)        # (K,) — K = window²-1
         self.offsets = offsets                          # list of (dy, dx)
 
@@ -280,10 +302,6 @@ class WeightedSpatialKernel(nn.Module):
                    during eval (see module/class docstrings).
         """
         # ── Eval mode: no stochastic corruption, pass through unchanged ──
-        # This is what makes val PSNR/SSIM comparable epoch-to-epoch —
-        # otherwise every call here would apply a fresh random pixel
-        # replacement and val metrics would swing based on random-seed
-        # luck rather than actual model improvement.
         if not self.training:
             return features
 
