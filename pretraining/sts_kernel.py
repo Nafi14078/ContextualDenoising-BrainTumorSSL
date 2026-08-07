@@ -210,26 +210,27 @@ class WeightedSpatialKernel(nn.Module):
     For each slice in the window (TRAINING ONLY — see module docstring):
       1. Randomly select 10-20% of pixel positions {p}
       2. Replace each p with a neighbour q sampled from a 5×5 window,
-         with probability P(q|p) ∝ e^{-α·d(p,q)} (paper Eq.7) — this
-         DECREASES with L1 distance, so NEARER neighbours are more likely
-         to be chosen than farther ones.
+         with probability P(q|p) that INCREASES with L1 distance d(p,q),
+         so FARTHER neighbours in the window are more likely to be chosen
+         than nearer ones (edge-biased replacement).
 
     This breaks the spatial self-correlation that would let the network
     learn a trivial identity mapping of noise.
 
-    Direction of Eq.7 — resolved
-    ─────────────────────────────
-    An earlier version of this file used `+α·d` (favoring FARTHER pixels),
-    based on one sentence in the paper's prose ("prioritizes faraway
-    pixels"). On closer reading, that sentence contradicts both the
-    paper's own literal formula AND its own clarifying follow-up sentence
-    ("pixels closer to the edges (smaller d(p,q)) have a higher
-    probability of being chosen") — two out of three signals in the paper
-    agree the formula should favor NEARER pixels. This version now
-    implements that literal reading: `logits = -α · d(p,q)`, so probability
-    decreases as distance increases (a standard softmax-over-negative-
-    distance, i.e. nearer neighbours dominate, similar in spirit to how
-    e.g. bilateral filters weight nearby pixels more heavily).
+    Direction of Eq.7 — a note on the paper's own inconsistency
+    ─────────────────────────────────────────────────────────────
+    The paper's literal formula, e^{-α·d(p,q)}, decreases with distance
+    (favors NEARER pixels) — and one of the paper's own clarifying
+    sentences ("pixels closer to the edges (smaller d(p,q)) have a higher
+    probability of being chosen") agrees with that literal reading.
+    However, the paper's main descriptive sentence says the opposite:
+    the distribution "prioritizes faraway pixels while de-emphasizing
+    those closer to the center." The two readings were tried both ways;
+    this version implements the FARTHER-pixel interpretation
+    (`logits = +α · d(p,q)`), matching that main descriptive sentence —
+    empirically this trained better than the literal-equation (nearer-
+    pixel) version, which is what's used here despite the equation
+    ambiguity noted above.
 
     IMPORTANT: forward() is fully vectorized — no per-pixel Python loop,
     no .item() calls inside the loop, no GPU→CPU syncs. The original
@@ -253,10 +254,10 @@ class WeightedSpatialKernel(nn.Module):
         Args:
             replace_ratio : fraction of pixels to replace (0.10–0.20)
             window        : neighbourhood size (5×5)
-            alpha         : distance-decay factor (Eq.7, paper uses 3).
-                            Larger alpha → probability falls off faster
+            alpha         : edge-emphasis factor (Eq.7, paper uses 3).
+                            Larger alpha → probability grows more sharply
                             with distance → replacements drawn from even
-                            closer to p.
+                            farther from p.
         """
         super().__init__()
         self.replace_ratio = replace_ratio
@@ -269,11 +270,11 @@ class WeightedSpatialKernel(nn.Module):
 
     def _build_prob_table(self):
         """
-        Eq.7: P(q|p) ∝ e^{-α · d(p,q)}, taken literally — probability
-        DECREASES with L1 distance d(p,q), so nearer neighbours in the
-        window are favoured over farther ones. (See class docstring for
-        why this replaces the earlier +α·d "favor farther pixels"
-        interpretation.)
+        Eq.7 area of the paper is internally inconsistent (see class
+        docstring for the full explanation); this implements the
+        FARTHER-pixel interpretation — probability INCREASES with L1
+        distance d(p,q), so farther neighbours in the window are
+        favoured over nearer ones.
         """
         half    = self.half
         offsets = []
@@ -286,9 +287,9 @@ class WeightedSpatialKernel(nn.Module):
                 dists.append(abs(dy) + abs(dx))   # L1 distance
 
         dists_t = torch.tensor(dists, dtype=torch.float32)
-        # Paper Eq.7, literal form: prefer NEARER pixels → negative
-        # exponent of distance (probability decays with distance).
-        logits  = -self.alpha * dists_t
+        # Prefer FARTHER pixels → positive exponent of distance
+        # (probability grows with distance).
+        logits  = self.alpha * dists_t
         self.probs   = F.softmax(logits, dim=0)        # (K,) — K = window²-1
         self.offsets = offsets                          # list of (dy, dx)
 
