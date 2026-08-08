@@ -15,29 +15,61 @@ Key behaviours:
   • WeightedSpatialKernel's stochastic blind-spot replacement is disabled
     during validation (see sts_kernel.py) so val PSNR/SSIM aren't corrupted
     by a fresh random pixel-replacement draw every epoch.
+  • Uses BOTH GPUs automatically when more than one is visible (e.g.
+    Kaggle's T4 x2), via nn.DataParallel — see "Multi-GPU" note below.
 
 Why there's no recurrent reference cache
 ─────────────────────────────────────────
 An earlier version of this file implemented the paper's Section 4 design —
 recurrently updating the L1 reference with each sample's own denoised
-output from the previous epoch, via a disk-backed cache. It worked, but it
-had a real operational cost: the cache is a large (multi-GB) file that
-lived in checkpoint_dir alongside the .pth checkpoints, which made
-downloading/zipping checkpoint_dir from Kaggle slow and unreliable — the
-whole point of checkpoint_dir is to hold small, easy-to-move artifacts.
+output from the previous epoch, via a disk-backed cache. It worked, but the
+cache is a large (multi-GB) file, and having it live in checkpoint_dir
+alongside the .pth checkpoints made downloading/zipping checkpoint_dir from
+Kaggle slow and unreliable. By request, the cache was removed entirely:
+checkpoint_dir now only ever contains .pth files, so it stays small and
+downloads cleanly. L1 reference is the noisy central slice every epoch
+(matching what the paper itself does at epoch 0) for the whole run.
 
-By request, the cache has been removed entirely rather than just moved
-elsewhere: checkpoint_dir now only ever contains .pth files (best_model.pth,
-epoch_XXX.pth, pretrain_encoder.pth), so it stays small and downloads
-cleanly. The tradeoff: L1 reference is the noisy central slice every epoch
-(matching what the paper itself does at epoch 0), for the entire run —
-this only matches the paper's Section 4 recurrent design at epoch 0, not
-subsequent epochs. The actual unsupervised denoising signal still comes
-from the STS blind-spot kernel (S) and temporal weighting (T), which are
-unaffected by this. If you want the recurrent-reference behaviour back,
-say so — it can be reintroduced pointed at a directory OUTSIDE
-checkpoint_dir (e.g. /kaggle/working/cache/, never downloaded/zipped) so
-it doesn't touch what you actually export.
+Multi-GPU (nn.DataParallel)
+─────────────────────────────
+The original training step called three separate methods on the model
+(`model.extract_all_features(...)`, then `sts(...)`, then `model(...)`)
+instead of one `forward()` call. nn.DataParallel only parallelizes a
+single forward() — calling separate methods on a wrapped model does NOT
+get split across GPUs. To fix this, `STSUVDPipeline` below wraps the
+entire per-batch computation (feature extraction -> STS sampling ->
+central denoise -> full-window denoise) into one forward() call, so
+nn.DataParallel can correctly scatter the batch dimension across all
+visible GPUs and gather the results back.
+
+Design notes:
+  • `model` and `sts` stay as their own top-level objects in main() (NOT
+    replaced by the pipeline) — this is what keeps checkpoint saving/
+    loading, `get_encoder_state_dict()`, and --resume completely unchanged.
+    The pipeline just holds references to them; wrapping it in
+    DataParallel never touches model.state_dict() / sts.state_dict()
+    (no "module." key prefix headaches).
+  • GroupNorm (not BatchNorm) is used throughout the network, which is
+    exactly what makes DataParallel safe here — GroupNorm's statistics are
+    computed per-sample, so a small per-GPU batch shard doesn't distort
+    normalization statistics the way BatchNorm would.
+  • `pipeline.train()` / `pipeline.eval()` are used instead of separately
+    toggling `model`/`sts` — this correctly propagates to both submodules
+    whether or not DataParallel is wrapping them.
+  • cfg["training"]["batch_size"] is the TOTAL batch size across all GPUs
+    when DataParallel is active (each GPU gets batch_size // num_gpus).
+    With the default batch_size=4 and 2 GPUs, that's only 2 samples/GPU —
+    workable, but small enough that per-step overhead eats into the
+    speedup. Consider raising batch_size (e.g. to 8) if VRAM allows, to
+    get more benefit from the second GPU.
+  • DataParallel gathers replicated outputs back to the primary GPU every
+    step and re-broadcasts weights every forward call — expect realistic
+    speedup in the ~1.3-1.6x range on 2 GPUs, not 2x. True
+    DistributedDataParallel scales better but needs per-rank process
+    launching, distributed samplers, and metric reduction across ranks —
+    a bigger change than this file makes; ask if you want that instead.
+  • Falls back to plain single-GPU (or CPU) execution automatically when
+    only one device is visible — no special-casing needed elsewhere.
 
 Run (Kaggle notebook cell):
     !python train_pretrain.py --config ../configs/pretrain_config.yaml
@@ -131,10 +163,57 @@ def load_checkpoint(path: Path, model, sts, optimizer, scaler, device):
     return start_epoch, best_psnr, scheduler_state
 
 
+# ── Multi-GPU pipeline wrapper ──────────────────────────────────────────────
+
+class STSUVDPipeline(nn.Module):
+    """
+    Combines feature extraction (G_φ) + STS sampling (𝒯, 𝒮) + denoising
+    into a SINGLE forward() call, so nn.DataParallel can correctly split
+    the batch dimension across multiple GPUs.
+
+    Without this wrapper, the training step called three separate methods
+    on the model (extract_all_features, then the STS module, then the
+    model again) — nn.DataParallel only parallelizes one forward() call,
+    so calling separate methods like that on a wrapped model runs
+    entirely on a single GPU regardless of how many are wrapped.
+
+    `model` and `sts` are stored by reference, not copied — this class is
+    purely an orchestration wrapper. Checkpointing/resuming still saves
+    and loads model.state_dict() / sts.state_dict() directly (see main()),
+    completely unaffected by whether this pipeline is wrapped in
+    DataParallel or not.
+    """
+
+    def __init__(self, model: UNetDenoiser, sts: STSModule):
+        super().__init__()
+        self.model = model
+        self.sts   = sts
+
+    def forward(self, noisy: torch.Tensor, epoch: int, max_epoch: int):
+        """
+        noisy : (B, N, 4, H, W) — this is the tensor nn.DataParallel
+                scatters across GPUs along the batch dimension (dim 0)
+                when this pipeline is wrapped. `epoch`/`max_epoch` are
+                plain ints, so DataParallel broadcasts them unchanged to
+                every replica rather than splitting them.
+
+        Returns:
+            denoised_central : (B, 4, H, W)
+            denoised_window  : (B, N, 4, H, W)
+            Both are automatically gathered back onto the primary GPU by
+            DataParallel when wrapped (it recurses through tuple outputs).
+        """
+        features = self.model.extract_all_features(noisy)      # (B, N, 21, H, W)
+        sampled  = self.sts(features, noisy, epoch, max_epoch) # (B, N, 21, H, W)
+        denoised_central = self.model(sampled)                 # (B, 4, H, W)
+        denoised_window  = _denoise_full_window(
+            self.model, sampled, self.sts.T.N)                 # (B, N, 4, H, W)
+        return denoised_central, denoised_window
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
-def train_one_epoch(model:       UNetDenoiser,
-                    sts:         STSModule,
+def train_one_epoch(pipeline:    nn.Module,
                     loader,
                     criterion:   PretrainLoss,
                     optimizer,
@@ -145,8 +224,7 @@ def train_one_epoch(model:       UNetDenoiser,
                     log_every:   int,
                     use_amp:     bool) -> dict:
 
-    model.train()
-    sts.train()
+    pipeline.train()   # propagates to model + sts whether or not DataParallel-wrapped
     running      = defaultdict(float)   # resets every log_every steps (for periodic logging)
     epoch_totals = defaultdict(float)   # NEVER resets — used for the true epoch-end average
 
@@ -168,26 +246,16 @@ def train_one_epoch(model:       UNetDenoiser,
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            # Step 1: Feature extraction G_φ
-            features = model.extract_all_features(noisy)  # (B, N, 21, H, W)
-
-            # Step 2: STS sampling (𝒯 + 𝒮) — computed ONCE, reused below
-            sampled  = sts(features, noisy, epoch, max_epochs)  # (B, N, 21, H, W)
-
-            # Step 3: Denoise central slice
-            denoised_central = model(sampled)              # (B, 4, H, W)
-
-            # Step 4: Reuse `sampled` for full-window denoising (no recompute)
-            denoised_window = _denoise_full_window(
-                model, sampled, sts.T.N)                  # (B, N, 4, H, W)
-
+            # Single forward() call — this is what makes multi-GPU
+            # scattering via nn.DataParallel actually work (see
+            # STSUVDPipeline docstring).
+            denoised_central, denoised_window = pipeline(noisy, epoch, max_epochs)
             loss_dict = criterion(denoised_central, reference, denoised_window)
             loss      = loss_dict["total"]
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(sts.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(pipeline.parameters()), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -222,6 +290,11 @@ def _denoise_full_window(model, sampled, N):
 
     sampled : (B, N, feat_ch, H, W) — output of sts(features, ...)
     Returns : (B, N, 4, H, W)
+
+    NOTE: called from inside STSUVDPipeline.forward(), i.e. once PER
+    REPLICA when wrapped in nn.DataParallel — `model` here is that
+    replica's local copy, `sampled` is already that replica's batch
+    shard, so this runs correctly per-GPU with no changes needed.
     """
     denoised_slices = []
     with torch.no_grad():
@@ -237,16 +310,14 @@ def _denoise_full_window(model, sampled, N):
 # ── Validation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model:    UNetDenoiser,
-             sts:      STSModule,
+def validate(pipeline:  nn.Module,
              loader,
              criterion: PretrainLoss,
              epoch:    int,
              max_epochs: int,
              device) -> dict:
 
-    model.eval()
-    sts.eval()
+    pipeline.eval()   # propagates to model + sts whether or not DataParallel-wrapped
     all_psnr, all_ssim = [], []
     total_l1, total_l2 = 0.0, 0.0
 
@@ -260,12 +331,9 @@ def validate(model:    UNetDenoiser,
         clean    = batch["clean"].to(device)
         C_idx    = batch["central"][0].item()
 
-        noisy_central = noisy[:, C_idx]
         clean_central = clean[:, C_idx]
 
-        features = model.extract_all_features(noisy)
-        sampled  = sts(features, noisy, epoch, max_epochs)
-        denoised = model(sampled)
+        denoised, dw = pipeline(noisy, epoch, max_epochs)
 
         # Use clean as reference for val PSNR/SSIM (we have pseudo-clean)
         for b in range(denoised.shape[0]):
@@ -274,7 +342,6 @@ def validate(model:    UNetDenoiser,
             all_psnr.append(compute_psnr(c, d))
             all_ssim.append(compute_ssim(c, d))
 
-        dw       = _denoise_full_window(model, sampled, sts.T.N)
         ld       = criterion(denoised, clean_central, dw)
         total_l1 += ld["l1"].item()
         total_l2 += ld["l2"].item()
@@ -306,16 +373,20 @@ def main(cfg_path: str, resume_path: str = None):
         cfg = yaml.safe_load(f)
 
     set_seed(cfg["training"]["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_gpus  = torch.cuda.device_count()
+    print(f"Device: {device}  |  GPUs visible: {num_gpus}")
 
     # ── Data ──
+    # num_workers bumped from 2 -> 4 when multi-GPU is active: two GPUs
+    # consuming batches can outpace a 2-worker CPU dataloader, especially
+    # since augmentation (crop/flip/rotate) happens per-sample in Python.
     train_loader, val_loader = get_pretrain_loaders(
         slices_dir          = cfg["data"]["output_slices"],
         N                   = cfg["sts"]["N"],
         patch_size          = cfg["data"]["patch_size"],
         batch_size          = cfg["training"]["batch_size"],
-        num_workers         = 2,
+        num_workers         = 4 if num_gpus > 1 else 2,
         max_train_subjects  = cfg["data"].get("max_train_subjects", None),
         max_val_subjects    = cfg["data"].get("max_val_subjects", None)
     )
@@ -348,6 +419,22 @@ def main(cfg_path: str, resume_path: str = None):
         weight_decay = float(cfg["training"]["weight_decay"])
     )
     scaler     = GradScaler(enabled=cfg["training"]["amp"])
+
+    # ── Multi-GPU pipeline ──
+    # `model` and `sts` remain the canonical objects used for checkpoint
+    # save/load and get_encoder_state_dict() below — the pipeline just
+    # wraps references to them for a single scatter-able forward() call.
+    pipeline = STSUVDPipeline(model, sts).to(device)
+    if num_gpus > 1:
+        print(f"[Multi-GPU] Wrapping pipeline in nn.DataParallel across "
+              f"{num_gpus} GPUs (device_ids=0..{num_gpus-1}).")
+        print(f"[Multi-GPU] cfg.training.batch_size={cfg['training']['batch_size']} "
+              f"is the TOTAL batch across all GPUs "
+              f"(~{cfg['training']['batch_size'] // num_gpus} samples/GPU).")
+        pipeline = nn.DataParallel(pipeline)
+    else:
+        print("[Multi-GPU] Only one GPU (or CPU) visible — running normally, "
+              "no DataParallel wrapping.")
 
     max_epochs = cfg["training"]["epochs"]
     delta      = cfg["training"]["delta"]
@@ -396,12 +483,12 @@ def main(cfg_path: str, resume_path: str = None):
         print(f"Epoch {epoch+1}/{max_epochs}")
 
         train_metrics = train_one_epoch(
-            model, sts, train_loader, criterion, optimizer,
+            pipeline, train_loader, criterion, optimizer,
             scaler, epoch, max_epochs, device,
             cfg["logging"]["log_every"], cfg["training"]["amp"])
 
         val_metrics = validate(
-            model, sts, val_loader, criterion,
+            pipeline, val_loader, criterion,
             epoch, max_epochs, device)
 
         scheduler.step()
@@ -413,7 +500,8 @@ def main(cfg_path: str, resume_path: str = None):
               f"SSIM: {val_metrics['ssim']:.4f} | "
               f"L2: {val_metrics['l2']:.6f}")
 
-        # Save best
+        # Save best — model/sts are the canonical (unwrapped) objects, so
+        # this state_dict has ordinary keys regardless of DataParallel.
         if val_metrics["psnr"] > best_psnr:
             best_psnr = val_metrics["psnr"]
             save_checkpoint({
@@ -447,6 +535,7 @@ def main(cfg_path: str, resume_path: str = None):
         prev_l2 = curr_l2
 
     # ── Save encoder weights for transfer ──────────────────────────────────
+    # model is the canonical (unwrapped) object — unaffected by DataParallel.
     encoder_weights = model.get_encoder_state_dict()
     encoder_path    = ckpt_dir / "pretrain_encoder.pth"
     torch.save(encoder_weights, encoder_path)
