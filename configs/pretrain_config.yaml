@@ -32,7 +32,7 @@ model:
   group_norm_groups: 8
 
 training:
-  epochs:           30
+  epochs:           50
   batch_size:       4            # 4 slice-windows per step
   lr:               0.0001
   lr_decay_step:    10           # halve LR every N epochs
