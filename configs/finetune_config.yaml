@@ -4,8 +4,8 @@
 # ─────────────────────────────────────────────
 
 data:
-  bratsped_root:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
-  output_slices:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped-preprocessed/bratsped-preprocessed"
+  bratsped_root:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset"
+  output_slices:    "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/bratsped_slices/bratsped_slices"
   modalities:       ["t1n", "t1c", "t2w", "t2f"]
   axis:             2
   slice_skip:       10
