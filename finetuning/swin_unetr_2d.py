@@ -23,6 +23,22 @@ ARCHITECTURE CHANGE FROM ORIGINAL DESIGN:
   The thesis claim is the same — SSL pretraining on BraTS2021 → transfer to
   BraTS-PED segmentation — just with a backbone that actually supports it.
 
+FIX (this version): the encoder only has TWO real downsampling stages.
+  enc1 and enc2 each pool *after* computing their conv stack, so their
+  skip connections (skip1, skip2) are captured BEFORE pooling:
+    skip1 is captured at full resolution   (H,   W)
+    skip2 is captured at half resolution   (H/2, W/2)
+  So by the time the decoder reaches its last stage, the features are
+  already back at full resolution (H, W) — the same resolution as the
+  feature_extractor output (f0) they need to fuse with. The previous
+  version still ran a stride-2 ConvTranspose2d there, upsampled to (2H,2W),
+  then immediately had to bilinear-interpolate it back down to (H, W) to
+  match f0's shape. That transpose conv was pure wasted compute whose
+  output got thrown away by the interpolation — it never contributed a
+  real decoding step. This version replaces that stage with SegFusionBlock,
+  which does no upsampling and simply fuses two already-matching feature
+  maps. Decoder stage count now correctly mirrors the true 2-level encoder.
+
 TWO-PHASE TRAINING:
   Phase 1: freeze pretrained encoder, train decoder + seg head only
   Phase 2: unfreeze all, fine-tune end-to-end with differential LR
@@ -72,10 +88,9 @@ class EncoderBlock(nn.Module):
 
 class SegDecoderBlock(nn.Module):
     """
-    Decoder block for segmentation.
-    Same structure as pretraining DecoderBlock but with 6 conv layers
-    as in the original paper description.
-    Trained from scratch in Phase 1 (encoder is frozen).
+    Decoder block that upsamples `x` by 2x, fuses with a skip connection at
+    that resolution, then applies conv layers. Used where a real spatial
+    resolution change is needed (dec2, dec1).
     """
     def __init__(self, in_ch, skip_ch, out_ch, gn_groups=8):
         super().__init__()
@@ -90,7 +105,35 @@ class SegDecoderBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        if x.shape != skip.shape:
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:],
+                              mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.convs(x)
+
+
+class SegFusionBlock(nn.Module):
+    """
+    Final decoder stage. Fuses two feature maps that are ALREADY at the
+    same spatial resolution — no upsampling needed. Used for dec0, which
+    fuses the full-resolution decoder output with the full-resolution
+    feature_extractor output (f0). See the module-level FIX note for why
+    this replaces a (now removed) redundant ConvTranspose2d step.
+    """
+    def __init__(self, in_ch, skip_ch, out_ch, gn_groups=8):
+        super().__init__()
+        merged = in_ch + skip_ch
+        self.convs = nn.Sequential(
+            ConvBlock(merged, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+            ConvBlock(out_ch, out_ch, groups=gn_groups),
+        )
+
+    def forward(self, x, skip):
+        # Defensive only: with the current encoder this is already a no-op,
+        # since x and skip are both at full resolution by construction.
+        if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(x, size=skip.shape[2:],
                               mode="bilinear", align_corners=False)
         x = torch.cat([x, skip], dim=1)
@@ -128,12 +171,15 @@ class SegUNet2D(nn.Module):
     Output : (B, num_classes, H, W)  — raw logits
 
     Encoder layers match pretraining UNetDenoiser exactly:
-      feature_extractor → 21-channel low-level features
-      enc1              → 48-channel spatial features (stride 2)
-      enc2              → 96-channel semantic features (stride 4)
+      feature_extractor → 21-channel low-level features (full res)
+      enc1              → 48-channel spatial features (skip @ full res, pooled to stride 2)
+      enc2              → 96-channel semantic features (skip @ stride 2, pooled to stride 4)
       bottleneck        → 192-channel deep features (stride 4)
 
     Decoder + head are NEW (random init), trained in Phase 1 with encoder frozen.
+      dec2 : stride 4 -> stride 2, fuse skip2   (real upsample)
+      dec1 : stride 2 -> stride 1, fuse skip1   (real upsample)
+      dec0 : stride 1 -> stride 1, fuse f0      (fusion only, no upsample)
     """
 
     def __init__(self,
@@ -162,8 +208,9 @@ class SegUNet2D(nn.Module):
                                     base_ch * 2, gn_groups)
         self.dec1 = SegDecoderBlock(base_ch * 2, base_ch,
                                     base_ch,     gn_groups)
-        self.dec0 = SegDecoderBlock(base_ch,     feat_ch,
-                                    base_ch // 2, gn_groups)
+        # dec0: fusion only (no upsample) — see FIX note above
+        self.dec0 = SegFusionBlock(base_ch, feat_ch,
+                                   base_ch // 2, gn_groups)
 
         # ── Segmentation head (NEW) ──
         self.seg_head = nn.Sequential(
@@ -182,8 +229,8 @@ class SegUNet2D(nn.Module):
         f0 = self.feature_extractor(x)     # (B, feat_ch, H, W)
 
         # Encoder
-        x1, skip1 = self.enc1(f0)          # x1: (B, 48, H/2, W/2)
-        x2, skip2 = self.enc2(x1)          # x2: (B, 96, H/4, W/4)
+        x1, skip1 = self.enc1(f0)          # x1: (B, 48, H/2, W/2)  | skip1: (B, 48, H, W)
+        x2, skip2 = self.enc2(x1)          # x2: (B, 96, H/4, W/4)  | skip2: (B, 96, H/2, W/2)
 
         # Bottleneck
         x3 = self.bottleneck(x2)           # (B, 192, H/4, W/4)
@@ -191,7 +238,7 @@ class SegUNet2D(nn.Module):
         # Decoder with skip connections
         x  = self.dec2(x3, skip2)          # (B, 96, H/2, W/2)
         x  = self.dec1(x,  skip1)          # (B, 48, H, W)
-        x  = self.dec0(x,  f0)             # (B, 24, H, W)
+        x  = self.dec0(x,  f0)             # (B, 24, H, W)  — fusion only, no upsample
 
         return self.seg_head(x)            # (B, num_classes, H, W)
 
@@ -215,6 +262,16 @@ class SegUNet2D(nn.Module):
              (48, 7, 21, 3, 3), average over the 7 groups →
              (48, 21, 3, 3). This preserves the learned filter
              structure while adapting to the new input dimension.
+
+        Note on scale: averaging (rather than summing) the 7 groups means
+        this layer's output magnitude at init will generally be smaller
+        than it was during pretraining (pretraining summed the contribution
+        of 7 different input slices; fine-tuning applies the averaged
+        kernel to a single slice). GroupNorm right after this layer absorbs
+        most of that scale shift, but since Phase 1 freezes the encoder for
+        `phase1_epochs`, this layer stays exactly as adapted for the whole
+        of Phase 1. The printout below reports the weight-norm before/after
+        adaptation so you can sanity-check it is not wildly off.
 
         Returns: number of matched layers (expect 48 after fix)
         """
@@ -242,14 +299,17 @@ class SegUNet2D(nn.Module):
                     # Average across the N_GROUPS of feat_ch channels
                     out_ch, in_ch_total, kH, kW = v.shape
                     feat_ch = model_dict[k].shape[1]   # 21
+                    pre_norm = v.norm().item()
                     adapted_weight = (
                         v.view(out_ch, N_GROUPS, feat_ch, kH, kW)
                          .mean(dim=1)                  # (48, 21, 3, 3)
                     )
+                    post_norm = adapted_weight.norm().item()
                     matched[k] = adapted_weight
                     adapted.append(
                         f"{k}: {tuple(v.shape)} → averaged "
-                        f"{N_GROUPS} groups → {tuple(adapted_weight.shape)}")
+                        f"{N_GROUPS} groups → {tuple(adapted_weight.shape)} "
+                        f"(||W|| {pre_norm:.3f} -> {post_norm:.3f})")
 
                 else:
                     misshape.append(
@@ -287,6 +347,10 @@ class SegUNet2D(nn.Module):
         """
         Phase 1: freeze all pretrained encoder layers.
         Only decoder + seg_head gradients flow.
+        Safe to call before wrapping in nn.DataParallel, or on the
+        underlying .module after wrapping — DataParallel re-reads
+        requires_grad from the source module on every forward call, so
+        freezing/unfreezing between phases does not require re-wrapping.
         """
         frozen = 0
         for name, param in self.named_parameters():
@@ -308,12 +372,14 @@ class SegUNet2D(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         print(f"[Phase 2] All {total:,} parameters unfrozen")
 
-    def get_parameter_groups(self, phase1_lr: float,
-                             phase2_lr: float) -> list:
+    def get_parameter_groups(self, base_lr: float) -> list:
         """
-        Differential LR for Phase 2:
-          encoder (pretrained) → 10× lower LR to protect learned features
-          decoder + head (new) → full phase2_lr
+        Differential LR for Phase 2 / joint training:
+          encoder (pretrained) → 10x lower LR to protect learned features
+          decoder + head (new) → full base_lr
+
+        (Previously this took a separate, unused `phase1_lr` argument that
+        had no effect on the returned groups — removed for clarity.)
         """
         encoder_params = [p for n, p in self.named_parameters()
                           if any(n.startswith(m)
@@ -322,8 +388,8 @@ class SegUNet2D(nn.Module):
                           if not any(n.startswith(m)
                                      for m in self._encoder_modules)]
         return [
-            {"params": encoder_params, "lr": phase2_lr * 0.1},
-            {"params": decoder_params, "lr": phase2_lr},
+            {"params": encoder_params, "lr": base_lr * 0.1},
+            {"params": decoder_params, "lr": base_lr},
         ]
 
 

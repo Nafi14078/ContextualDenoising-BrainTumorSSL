@@ -1,5 +1,6 @@
 # ─────────────────────────────────────────────
 #  Fine-tuning Config  (BraTS-PED → Seg U-Net 2D)
+#  Single-phase full fine-tuning: no encoder freezing, one LR for everything.
 # ─────────────────────────────────────────────
 
 data:
@@ -21,23 +22,20 @@ model:
   base_channels:    48
   feat_ch:          21
   group_norm_groups: 8
-  img_size:         192
-  feature_size:     48
 
 training:
-  phase1_epochs:    30
-  phase1_lr:        0.0001
-  phase2_epochs:    70
-  phase2_lr:        0.00005
+  epochs:           100        # replaces phase1_epochs (30) + phase2_epochs (70)
+  lr:               0.00005    # single LR for the whole model — replaces phase1_lr/phase2_lr
 
-  # Cosine warm restarts (for both joint and two-phase)
+  # Cosine warm restarts
   cosine_T0:        20         # initial cycle length in epochs
   cosine_Tmult:     2          # cycle length multiplier after each restart
 
   # Early stopping
-  early_stop_patience: 15      # stop if no EMA Dice improvement for N epochs
+  early_stop_patience: 15      # stop if val Dice does not improve for N epochs
 
-  batch_size:       8
+  batch_size:       16         # split across GPUs by DataParallel (~8/GPU on 2 GPUs)
+  num_workers:      4          # CPU data-loading workers; raise if GPUs sit idle waiting on data
   weight_decay:     0.00001
   amp:              true
   use_checkpoint:   false

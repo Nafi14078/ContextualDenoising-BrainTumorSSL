@@ -3,25 +3,67 @@ finetuning/train_finetune.py
 ────────────────────────────────────────────────────────────────────────────────
 Fine-tuning loop for BraTS-PED 2D segmentation.
 
-Two training modes (controlled by --joint flag):
-
-  DEFAULT (two-phase):
-    Phase 1 (epochs 1-30): encoder frozen, decoder warms up
-    Phase 2 (epochs 31-100): all layers unfrozen, differential LR
-
-  JOINT (--joint flag):
-    Single phase: all layers trained together from epoch 1
-    Encoder LR = 0.1 x decoder LR (no hard freeze)
-    Recommended for pretrained encoder
+SINGLE-PHASE FULL FINE-TUNING (no encoder freezing, no phase split):
+  Every parameter — pretrained encoder included — is trainable from epoch 1
+  with a single learning rate and a single optimizer, the standard way most
+  fine-tuning is done. (Earlier versions of this script had a two-phase
+  freeze-then-unfreeze scheme and a separate encoder/decoder LR split —
+  both have been removed here at the user's request in favor of plain,
+  uniform full fine-tuning.)
 
 Best model saved on single val Dice (standard research practice).
 TTA used in validation for better accuracy.
-Early stopping when val Dice does not improve for patience epochs.
+Early stopping when val Dice does not improve for `patience` epochs.
+
+Learning rate / epoch count come from the config, with fallbacks so this
+still runs against an existing two-phase-style config without edits:
+  epochs : cfg["training"]["epochs"]
+           -> falls back to phase1_epochs + phase2_epochs if "epochs" absent
+  lr     : cfg["training"]["lr"]
+           -> falls back to phase2_lr if "lr" absent
+For a clean config going forward, just set:
+  training:
+    epochs: 100
+    lr: 0.00005
+and you can delete phase1_epochs / phase2_epochs / phase1_lr / phase2_lr.
+
+────────────────────────────────────────────────────────────────────────────────
+MULTI-GPU (both Kaggle T4s)
+────────────────────────────────────────────────────────────────────────────────
+This script automatically uses every visible GPU via nn.DataParallel — no
+flags needed, it just detects torch.cuda.device_count() > 1.
+
+Why plain nn.DataParallel makes GPU-0 memory blow up (and the fix used here):
+  By default, DataParallel scatters the input batch across GPUs, runs the
+  model forward on each shard, then GATHERS every shard's full output
+  tensor back onto GPU 0 before you can compute the loss there. For
+  segmentation that means the full (B, C, H, W) logits tensor gets
+  duplicated on GPU 0 alongside its own shard, gradients, and optimizer
+  state — so GPU 0 can end up needing meaningfully more memory than GPU 1
+  and be the one that OOMs first, even though "both GPUs are only half
+  full" by naive accounting.
+
+  Fix: `ModelWithLoss` below wraps the model AND the loss function
+  together, so the loss is computed independently on each GPU, on that
+  GPU's own shard of logits. Only three small scalar tensors (total, dice,
+  focal loss) get gathered back to GPU 0 instead of the full logits tensor.
+  Gradient reduction during backward still happens automatically through
+  autograd exactly as it always does with DataParallel — this only changes
+  what gets *gathered*, not how gradients flow.
+
+  Validation does not train, so this concern doesn't apply there — a
+  separate `infer_model` (DataParallel-wrapped raw model, no loss) is used
+  during validation/TTA so both GPUs help speed up eval too.
+
+Effective batch size: DataParallel splits `training.batch_size` across your
+GPUs (e.g. batch_size=8 with 2 GPUs -> 4 samples per GPU per step). If you
+want each GPU to still see ~8 samples per step, raise `training.batch_size`
+in the config to ~16 now that you have 2 GPUs.
 
 Run:
     python train_finetune.py --config ../configs/finetune_config.yaml
-    python train_finetune.py --config ../configs/finetune_config.yaml --joint
-    python train_finetune.py --config ../configs/finetune_config.yaml --joint --resume /path/ckpt.pth
+    python train_finetune.py --config ../configs/finetune_config.yaml --resume /path/ckpt.pth
+────────────────────────────────────────────────────────────────────────────────
 """
 
 import sys
@@ -32,9 +74,10 @@ from pathlib import Path
 from collections import defaultdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from finetuning.dataset       import get_finetune_loaders
@@ -42,6 +85,44 @@ from finetuning.swin_unetr_2d import build_model
 from finetuning.losses        import CombinedSegLoss
 from evaluation.metrics       import (compute_dice_wt, compute_dice_tc,
                                       compute_dice_et, compute_hd95)
+
+
+# ── Multi-GPU wrapper ─────────────────────────────────────────────────────────
+
+class ModelWithLoss(nn.Module):
+    """
+    Wraps model + loss so that when replicated across GPUs by
+    nn.DataParallel, each GPU computes ITS OWN loss locally from its own
+    shard of logits. Only small scalar tensors get gathered back to the
+    primary GPU, instead of the full (B, C, H, W) logits tensor. This keeps
+    GPU-0 memory usage in line with the other GPUs instead of it silently
+    ballooning. See the module docstring above for the full explanation.
+    """
+    def __init__(self, model: nn.Module, criterion: nn.Module):
+        super().__init__()
+        self.model     = model
+        self.criterion = criterion
+
+    def forward(self, images, masks):
+        logits    = self.model(images)
+        loss_dict = self.criterion(logits, masks)
+        # unsqueeze(0): DataParallel concatenates per-GPU outputs along dim 0,
+        # so each GPU must return at least a 1-D tensor, not a bare scalar.
+        total = loss_dict["total"].unsqueeze(0)
+        dice  = loss_dict["dice"].unsqueeze(0)
+        focal = loss_dict["focal"].unsqueeze(0)
+        return total, dice, focal
+
+
+def gpu_mem_string() -> str:
+    """Short 'g0=1.2G|g1=1.1G' string for the tqdm postfix."""
+    if not torch.cuda.is_available():
+        return "cpu"
+    parts = []
+    for i in range(torch.cuda.device_count()):
+        used = torch.cuda.memory_allocated(i) / 1e9
+        parts.append(f"g{i}={used:.1f}G")
+    return "|".join(parts)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -63,7 +144,9 @@ def save_checkpoint(state, path):
 def load_checkpoint(path, model, optimizer, scaler, scheduler, device):
     """
     Restore full training state. Handles optimizer group mismatch gracefully.
-    Returns: (start_epoch, start_phase, best_dice)
+    `model` must be the raw (unwrapped) model — never the DataParallel wrapper
+    — so state_dict keys stay plain and portable across GPU-count changes.
+    Returns: (start_epoch, best_dice)
     """
     print(f"\n[Resume] Loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=device)
@@ -92,28 +175,31 @@ def load_checkpoint(path, model, optimizer, scaler, scheduler, device):
         print(f"  [WARN] No scheduler state -- fast-forwarded {ckpt['epoch']+1} steps")
 
     start_epoch = ckpt.get("epoch", 0) + 1
-    start_phase = ckpt.get("phase", 1)
     best_dice   = ckpt.get("best_dice", -1.0)
 
-    print(f"  Resumed from Phase {start_phase}, epoch {start_epoch}")
+    print(f"  Resumed at epoch {start_epoch}")
     print(f"  Best Dice so far: {best_dice:.4f}\n")
-    return start_epoch, start_phase, best_dice
+    return start_epoch, best_dice
 
 
 # ── Test-Time Augmentation ────────────────────────────────────────────────────
 
 @torch.no_grad()
-def predict_tta(model, images, device):
-    """Average predictions across 4 rotations + horizontal flip."""
-    model.eval()
+def predict_tta(infer_model, images, device):
+    """
+    Average predictions across 4 rotations + horizontal flip.
+    `infer_model` is the (possibly DataParallel-wrapped) raw model, used
+    for inference only — no loss involved, so both GPUs help here too.
+    """
+    infer_model.eval()
     preds = []
     for k in range(4):
         aug   = torch.rot90(images, k=k, dims=[2, 3])
-        logit = model(aug.to(device))
+        logit = infer_model(aug.to(device))
         logit = torch.rot90(logit, k=-k, dims=[2, 3])
         preds.append(F.softmax(logit, dim=1))
     aug   = torch.flip(images, dims=[3])
-    logit = model(aug.to(device))
+    logit = infer_model(aug.to(device))
     logit = torch.flip(logit, dims=[3])
     preds.append(F.softmax(logit, dim=1))
     return torch.stack(preds).mean(0)
@@ -121,46 +207,62 @@ def predict_tta(model, images, device):
 
 # ── Training epoch ────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, criterion, optimizer,
+def train_one_epoch(train_model, raw_model, loader, optimizer,
                     scaler, device, log_every, use_amp, epoch_label=""):
-    model.train()
+    """
+    `train_model` is ModelWithLoss, optionally DataParallel-wrapped — used
+    for the forward+backward pass so both GPUs share the training work.
+    `raw_model` is the underlying SegUNet2D — used for gradient clipping,
+    since clip_grad_norm_ needs the actual parameter tensors, not the
+    wrapper's.
+    """
+    train_model.train()
     running      = defaultdict(float)
     epoch_totals = defaultdict(float)
     batch_size    = loader.batch_size
     total_samples = len(loader.dataset)
-    pbar = tqdm(loader, desc=f"Train {epoch_label}", unit="batch")
+    pbar = tqdm(loader, desc=f"Train {epoch_label}", unit="batch",
+                dynamic_ncols=True, leave=True)
 
     for step, batch in enumerate(pbar):
-        images = batch["image"].to(device)
-        masks  = batch["mask"].to(device)
+        images = batch["image"].to(device, non_blocking=True)
+        masks  = batch["mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            logits    = model(images)
-            loss_dict = criterion(logits, masks)
-            loss      = loss_dict["total"]
+            total, dice, focal = train_model(images, masks)
+            loss = total.mean()   # mean over GPUs (each already meaned over its shard)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
+        loss_dict = {
+            "total": loss.item(),
+            "dice":  dice.mean().item(),
+            "focal": focal.mean().item(),
+        }
         for k, v in loss_dict.items():
-            running[k]      += v.item()
-            epoch_totals[k] += v.item()
+            running[k]      += v
+            epoch_totals[k] += v
 
-        samples_done = (step + 1) * batch_size
+        samples_done = min((step + 1) * batch_size, total_samples)
         pct          = samples_done / total_samples * 100
         pbar.set_postfix({
-            "samples": f"{min(samples_done, total_samples)}/{total_samples}",
-            "%": f"{pct:.1f}", "loss": f"{loss.item():.4f}"})
+            "samples": f"{samples_done}/{total_samples}",
+            "%": f"{pct:.1f}",
+            "loss": f"{loss.item():.4f}",
+            "gpu": gpu_mem_string(),
+        })
 
         if (step + 1) % log_every == 0:
             avg = {k: v / log_every for k, v in running.items()}
             tqdm.write(
                 f"  {epoch_label} step {step+1}/{len(loader)} ({pct:.1f}%) | " +
-                " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
+                " | ".join(f"{k}: {v:.4f}" for k, v in avg.items()) +
+                f" | gpu: {gpu_mem_string()}")
             running = defaultdict(float)
 
     return {k: v / len(loader) for k, v in epoch_totals.items()}
@@ -169,24 +271,29 @@ def train_one_epoch(model, loader, criterion, optimizer,
 # ── Validation with TTA ───────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, loader, criterion, device,
+def validate(infer_model, loader, criterion, device,
              use_tta=True, epoch_label=""):
-    model.eval()
+    """
+    `infer_model` is the raw model (optionally DataParallel-wrapped, no
+    loss attached) — used both for the plain forward pass loss and for TTA.
+    """
+    infer_model.eval()
     dice_wt, dice_tc, dice_et = [], [], []
     hd95_wt, hd95_tc, hd95_et = [], [], []
     total_loss = 0.0
-    pbar = tqdm(loader, desc=f"Val   {epoch_label}", unit="batch", leave=False)
+    pbar = tqdm(loader, desc=f"Val   {epoch_label}", unit="batch",
+                dynamic_ncols=True, leave=True)
 
     for batch in pbar:
-        images = batch["image"].to(device)
-        masks  = batch["mask"].to(device)
+        images = batch["image"].to(device, non_blocking=True)
+        masks  = batch["mask"].to(device, non_blocking=True)
 
-        logits    = model(images)
+        logits    = infer_model(images)
         loss_dict = criterion(logits, masks)
         total_loss += loss_dict["total"].item()
 
         if use_tta:
-            probs = predict_tta(model, images, device)
+            probs = predict_tta(infer_model, images, device)
             preds = probs.argmax(dim=1)
         else:
             preds = logits.argmax(dim=1)
@@ -206,7 +313,9 @@ def validate(model, loader, criterion, device,
             pbar.set_postfix({
                 "WT": f"{np.mean(dice_wt):.3f}",
                 "TC": f"{np.mean(dice_tc):.3f}",
-                "ET": f"{np.mean(dice_et):.3f}"})
+                "ET": f"{np.mean(dice_et):.3f}",
+                "gpu": gpu_mem_string(),
+            })
 
     mean_dice = float(np.mean(
         [np.mean(dice_wt), np.mean(dice_tc), np.mean(dice_et)]))
@@ -227,12 +336,11 @@ def validate(model, loader, criterion, device,
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
-def save_best(model, optimizer, scaler, scheduler,
-              epoch, phase, best_dice, val_metrics, ckpt_dir):
+def save_best(raw_model, optimizer, scaler, scheduler,
+              epoch, best_dice, val_metrics, ckpt_dir):
     save_checkpoint({
         "epoch":     epoch,
-        "phase":     phase,
-        "model":     model.state_dict(),
+        "model":     raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -243,43 +351,46 @@ def save_best(model, optimizer, scaler, scheduler,
     }, ckpt_dir / "best_model.pth")
 
 
-def save_periodic(model, optimizer, scaler, scheduler,
-                  epoch, phase, best_dice, ckpt_dir, prefix):
+def save_periodic(raw_model, optimizer, scaler, scheduler,
+                  epoch, best_dice, ckpt_dir):
     save_checkpoint({
         "epoch":     epoch,
-        "phase":     phase,
-        "model":     model.state_dict(),
+        "model":     raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict(),
         "best_dice": best_dice,
-    }, ckpt_dir / f"{prefix}_epoch_{epoch+1:03d}.pth")
+    }, ckpt_dir / f"epoch_{epoch+1:03d}.pth")
 
 
-# ── Joint training (single-phase, no freeze) ──────────────────────────────────
+# ── Training ───────────────────────────────────────────────────────────────────
 
-def run_joint_training(model, cfg, train_loader, val_loader,
-                       criterion, scaler, device, resume_path=None):
+def run_training(train_model, infer_model, raw_model, cfg,
+                 train_loader, val_loader, criterion, scaler,
+                 device, resume_path=None):
     """
-    All layers trained together from epoch 1.
-    Encoder gets 10x lower LR than decoder — differential LR replaces hard freeze.
+    Single-phase full fine-tuning: every parameter trains from epoch 1 with
+    one optimizer and one learning rate. No freezing, no phase split.
     Best model saved on single val Dice (standard research practice).
     """
-    total_epochs = (cfg["training"]["phase1_epochs"] +
-                    cfg["training"]["phase2_epochs"])
-    p1_lr        = float(cfg["training"]["phase1_lr"])
-    p2_lr        = float(cfg["training"]["phase2_lr"])
-    ckpt_dir     = Path(cfg["training"]["checkpoint_dir"])
-    log_every    = cfg["logging"]["log_every"]
-    use_amp      = cfg["training"]["amp"]
-    save_every   = cfg["training"]["save_every"]
-    patience     = cfg["training"].get("early_stop_patience", 15)
+    total_epochs = cfg["training"].get(
+        "epochs",
+        cfg["training"].get("phase1_epochs", 0) + cfg["training"].get("phase2_epochs", 100))
+    lr = float(cfg["training"].get("lr", cfg["training"].get("phase2_lr", 1e-4)))
 
-    model.unfreeze_all()
-    param_groups = model.get_parameter_groups(p1_lr, p2_lr)
+    ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
+    log_every  = cfg["logging"]["log_every"]
+    use_amp    = cfg["training"]["amp"]
+    save_every = cfg["training"]["save_every"]
+    patience   = cfg["training"].get("early_stop_patience", 15)
+
+    # Every parameter is trainable — explicit call for clarity, though a
+    # freshly built model already has requires_grad=True everywhere.
+    raw_model.unfreeze_all()
+
     optimizer = torch.optim.AdamW(
-        param_groups,
-        weight_decay=float(cfg["training"]["weight_decay"]))
+        raw_model.parameters(),
+        lr=lr, weight_decay=float(cfg["training"]["weight_decay"]))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=cfg["training"].get("cosine_T0", 20),
@@ -291,26 +402,26 @@ def run_joint_training(model, cfg, train_loader, val_loader,
     no_improve  = 0
 
     if resume_path and Path(resume_path).exists():
-        start_epoch, _, best_dice = load_checkpoint(
-            resume_path, model, optimizer, scaler, scheduler, device)
+        start_epoch, best_dice = load_checkpoint(
+            resume_path, raw_model, optimizer, scaler, scheduler, device)
 
     print("\n" + "="*60)
-    print("JOINT TRAINING -- all layers, differential LR")
-    print(f"  Encoder LR : {p2_lr*0.1:.2e} | Decoder LR: {p2_lr:.2e}")
-    print(f"  Total epochs: {total_epochs} | Early stop patience: {patience}")
+    print("FULL FINE-TUNING -- all layers trainable from epoch 1")
+    print(f"  LR: {lr:.2e} | Total epochs: {total_epochs} | "
+          f"Early stop patience: {patience}")
     print(f"  Best model: saved on single val mean Dice (standard)")
     print("="*60)
 
     for epoch in range(start_epoch, total_epochs):
-        label = f"[J {epoch+1}/{total_epochs}]"
+        label = f"[{epoch+1}/{total_epochs}]"
         print(f"\n{label}")
 
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer,
+            train_model, raw_model, train_loader, optimizer,
             scaler, device, log_every, use_amp, epoch_label=label)
 
         val_metrics = validate(
-            model, val_loader, criterion, device,
+            infer_model, val_loader, criterion, device,
             use_tta=True, epoch_label=label)
 
         scheduler.step()
@@ -325,15 +436,15 @@ def run_joint_training(model, cfg, train_loader, val_loader,
             print(f"  HD95  -- WT: {val_metrics['hd95_wt']:.2f} | "
                   f"TC: {val_metrics['hd95_tc']:.2f} | "
                   f"ET: {val_metrics['hd95_et']:.2f}")
-        print(f"  LR (decoder): {optimizer.param_groups[1]['lr']:.2e}")
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         # Save best on single val Dice — standard research approach
         curr_dice = val_metrics["dice_mean"]
         if curr_dice > best_dice:
             best_dice  = curr_dice
             no_improve = 0
-            save_best(model, optimizer, scaler, scheduler,
-                      epoch, 2, best_dice, val_metrics, ckpt_dir)
+            save_best(raw_model, optimizer, scaler, scheduler,
+                      epoch, best_dice, val_metrics, ckpt_dir)
             print(f"  New best Dice: {best_dice:.4f}")
         else:
             no_improve += 1
@@ -341,162 +452,12 @@ def run_joint_training(model, cfg, train_loader, val_loader,
                   f"(best: {best_dice:.4f})")
 
         if (epoch + 1) % save_every == 0:
-            save_periodic(model, optimizer, scaler, scheduler,
-                          epoch, 2, best_dice, ckpt_dir, "joint")
+            save_periodic(raw_model, optimizer, scaler, scheduler,
+                          epoch, best_dice, ckpt_dir)
 
         if no_improve >= patience:
             print(f"\nEarly stopping at epoch {epoch+1} "
                   f"(no improvement for {patience} epochs)")
-            break
-
-    print(f"\nJoint training complete. Best val Dice: {best_dice:.4f}")
-    return best_dice
-
-
-# ── Two-phase training ────────────────────────────────────────────────────────
-
-def run_two_phase_training(model, cfg, train_loader, val_loader,
-                           criterion, scaler, device, resume_path=None):
-    """
-    Original two-phase training.
-    Phase 1: encoder frozen, decoder warms up.
-    Phase 2: all layers unfrozen, differential LR.
-    Best model saved on single val Dice — standard research practice.
-    """
-    p1_epochs  = cfg["training"]["phase1_epochs"]
-    p1_lr      = float(cfg["training"]["phase1_lr"])
-    p2_epochs  = cfg["training"]["phase2_epochs"]
-    p2_lr      = float(cfg["training"]["phase2_lr"])
-    ckpt_dir   = Path(cfg["training"]["checkpoint_dir"])
-    log_every  = cfg["logging"]["log_every"]
-    use_amp    = cfg["training"]["amp"]
-    save_every = cfg["training"]["save_every"]
-    patience   = cfg["training"].get("early_stop_patience", 15)
-
-    best_dice    = -1.0
-    resume_phase = 1
-    resume_epoch = 0
-
-    # ── Phase 1 setup ──────────────────────────────────────────────────────
-    model.freeze_encoder()
-    p1_optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=p1_lr, weight_decay=float(cfg["training"]["weight_decay"]))
-    p1_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        p1_optimizer, T_0=10, T_mult=1, eta_min=1e-7)
-
-    if resume_path and Path(resume_path).exists():
-        resume_epoch, resume_phase, best_dice = load_checkpoint(
-            resume_path, model, p1_optimizer, scaler, p1_scheduler, device)
-
-    # ── Phase 1 ────────────────────────────────────────────────────────────
-    if resume_phase == 1:
-        print("\n" + "="*60)
-        print("PHASE 1 -- Decoder warmup (encoder frozen)")
-        print(f"  Best model: saved on single val mean Dice (standard)")
-        print("="*60)
-        no_improve = 0
-
-        for epoch in range(resume_epoch, p1_epochs):
-            label = f"[P1 {epoch+1}/{p1_epochs}]"
-            print(f"\n{label}")
-
-            train_metrics = train_one_epoch(
-                model, train_loader, criterion, p1_optimizer,
-                scaler, device, log_every, use_amp, epoch_label=label)
-            val_metrics = validate(
-                model, val_loader, criterion, device,
-                use_tta=True, epoch_label=label)
-            p1_scheduler.step()
-
-            print(f"  Train -- " +
-                  " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
-            print(f"  Val   -- WT: {val_metrics['dice_wt']:.4f} | "
-                  f"TC: {val_metrics['dice_tc']:.4f} | "
-                  f"ET: {val_metrics['dice_et']:.4f} | "
-                  f"Mean: {val_metrics['dice_mean']:.4f}")
-
-            curr_dice = val_metrics["dice_mean"]
-            if curr_dice > best_dice:
-                best_dice  = curr_dice
-                no_improve = 0
-                save_best(model, p1_optimizer, scaler, p1_scheduler,
-                          epoch, 1, best_dice, val_metrics, ckpt_dir)
-                print(f"  New best Dice: {best_dice:.4f}")
-            else:
-                no_improve += 1
-                print(f"  No improvement for {no_improve}/{patience} epochs")
-
-            if (epoch + 1) % save_every == 0:
-                save_periodic(model, p1_optimizer, scaler, p1_scheduler,
-                              epoch, 1, best_dice, ckpt_dir, "phase1")
-
-        resume_epoch = 0
-
-    # ── Phase 2 ────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 2 -- Full fine-tuning (all layers unfrozen)")
-    print(f"  Best model: saved on single val mean Dice (standard)")
-    print("="*60)
-
-    model.unfreeze_all()
-    param_groups = model.get_parameter_groups(p1_lr, p2_lr)
-    p2_optimizer = torch.optim.AdamW(
-        param_groups, weight_decay=float(cfg["training"]["weight_decay"]))
-    p2_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        p2_optimizer,
-        T_0=cfg["training"].get("cosine_T0", 20),
-        T_mult=cfg["training"].get("cosine_Tmult", 2),
-        eta_min=1e-7)
-
-    if resume_phase == 2 and resume_path and Path(resume_path).exists():
-        _, _, best_dice = load_checkpoint(
-            resume_path, model, p2_optimizer, scaler, p2_scheduler, device)
-
-    no_improve = 0
-
-    for epoch in range(resume_epoch, p2_epochs):
-        label = f"[P2 {epoch+1}/{p2_epochs}]"
-        print(f"\n{label}")
-
-        train_metrics = train_one_epoch(
-            model, train_loader, criterion, p2_optimizer,
-            scaler, device, log_every, use_amp, epoch_label=label)
-        val_metrics = validate(
-            model, val_loader, criterion, device,
-            use_tta=True, epoch_label=label)
-        p2_scheduler.step()
-
-        print(f"  Train -- " +
-              " | ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items()))
-        print(f"  Val   -- WT: {val_metrics['dice_wt']:.4f} | "
-              f"TC: {val_metrics['dice_tc']:.4f} | "
-              f"ET: {val_metrics['dice_et']:.4f} | "
-              f"Mean: {val_metrics['dice_mean']:.4f}")
-        if "hd95_wt" in val_metrics:
-            print(f"  HD95  -- WT: {val_metrics['hd95_wt']:.2f} | "
-                  f"TC: {val_metrics['hd95_tc']:.2f} | "
-                  f"ET: {val_metrics['hd95_et']:.2f}")
-        print(f"  LR (decoder): {p2_optimizer.param_groups[1]['lr']:.2e}")
-
-        curr_dice = val_metrics["dice_mean"]
-        if curr_dice > best_dice:
-            best_dice  = curr_dice
-            no_improve = 0
-            save_best(model, p2_optimizer, scaler, p2_scheduler,
-                      epoch, 2, best_dice, val_metrics, ckpt_dir)
-            print(f"  New best Dice: {best_dice:.4f}")
-        else:
-            no_improve += 1
-            print(f"  No improvement for {no_improve}/{patience} epochs "
-                  f"(best: {best_dice:.4f})")
-
-        if (epoch + 1) % save_every == 0:
-            save_periodic(model, p2_optimizer, scaler, p2_scheduler,
-                          epoch, 2, best_dice, ckpt_dir, "phase2")
-
-        if no_improve >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1}")
             break
 
     print(f"\nTraining complete. Best val Dice: {best_dice:.4f}")
@@ -505,22 +466,33 @@ def run_two_phase_training(model, cfg, train_loader, val_loader,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(cfg_path, resume_path=None, joint=False):
+def main(cfg_path, resume_path=None):
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
 
     set_seed(cfg["training"]["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Mode  : {'JOINT (single-phase, no freeze)' if joint else 'TWO-PHASE'}")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    n_gpus = torch.cuda.device_count()
+    print(f"Device: {device} | GPUs visible: {n_gpus}")
+    print("Mode  : FULL FINE-TUNING (single phase, no encoder freezing)")
 
     train_loader, val_loader = get_finetune_loaders(
         slices_dir  = cfg["data"]["output_slices"],
         patch_size  = cfg["data"]["patch_size"],
         batch_size  = cfg["training"]["batch_size"],
-        num_workers = 2)
+        num_workers = cfg["training"].get("num_workers", 4))
 
-    model = build_model(cfg, device)
+    if n_gpus > 1:
+        per_gpu = cfg["training"]["batch_size"] // n_gpus
+        print(f"[Multi-GPU] batch_size={cfg['training']['batch_size']} "
+              f"split across {n_gpus} GPUs (~{per_gpu}/GPU). "
+              f"Raise training.batch_size in the config if GPUs look under-used.")
+
+    # raw_model: the actual SegUNet2D. All custom methods (unfreeze_all,
+    # load_pretrained_encoder, state_dict/load_state_dict for checkpoints)
+    # are ALWAYS called on this object directly, never on a DataParallel
+    # wrapper.
+    raw_model = build_model(cfg, device)
 
     criterion = CombinedSegLoss(
         num_classes  = cfg["data"]["num_classes"],
@@ -529,14 +501,26 @@ def main(cfg_path, resume_path=None, joint=False):
         focal_gamma  = float(cfg["loss"]["focal_gamma"]),
         focal_alpha  = float(cfg["loss"]["focal_alpha"]))
 
+    # train_model: used ONLY for the forward+backward training pass.
+    # Wraps model+loss together so DataParallel gathers small scalars
+    # instead of full logits (keeps GPU-0 memory from ballooning).
+    train_model = ModelWithLoss(raw_model, criterion).to(device)
+
+    # infer_model: used ONLY for validation/TTA forward passes (no
+    # backward, so gathering logits back to GPU 0 here is cheap/transient).
+    infer_model = raw_model
+
+    if n_gpus > 1:
+        device_ids  = list(range(n_gpus))
+        train_model = nn.DataParallel(train_model, device_ids=device_ids)
+        infer_model = nn.DataParallel(raw_model,   device_ids=device_ids)
+        print(f"[Multi-GPU] Wrapped for training + inference on GPUs {device_ids}")
+
     scaler = GradScaler(enabled=cfg["training"]["amp"])
 
-    if joint:
-        run_joint_training(model, cfg, train_loader, val_loader,
-                           criterion, scaler, device, resume_path)
-    else:
-        run_two_phase_training(model, cfg, train_loader, val_loader,
-                               criterion, scaler, device, resume_path)
+    run_training(train_model, infer_model, raw_model, cfg,
+                train_loader, val_loader, criterion, scaler,
+                device, resume_path)
 
 
 if __name__ == "__main__":
@@ -544,7 +528,5 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="../configs/finetune_config.yaml")
     parser.add_argument("--resume", default=None,
                         help="Path to checkpoint to resume from.")
-    parser.add_argument("--joint", action="store_true",
-                        help="Joint single-phase training (no encoder freeze).")
     args = parser.parse_args()
-    main(args.config, args.resume, args.joint)
+    main(args.config, args.resume)

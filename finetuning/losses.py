@@ -17,6 +17,12 @@ Evaluation sub-regions (computed from raw labels):
   WT (whole tumor)      = labels {1, 2, 3}
   TC (tumor core)       = labels {1, 3}
   ET (enhancing tumor)  = label  {3}
+
+NOTE: No bugs were found in this file during review — it is included
+unchanged so you have a complete, matching set of the four fine-tuning
+files. It also works as-is with the multi-GPU setup in train_finetune.py:
+the loss module has no learnable parameters, so nn.DataParallel replicating
+it across GPUs is a no-op cost-wise.
 ────────────────────────────────────────────────────────────────────────────────
 """
 

@@ -13,6 +13,13 @@ Augmentation (train only, applied identically to image and mask):
   • Random 90° rotation
   • Random intensity scale/shift per modality (image only)
   • Random Gaussian noise (image only, σ ~ U[0, 0.02])
+
+NOTE ON MULTI-GPU:
+  This file needs NO changes to support multiple GPUs. nn.DataParallel
+  splits whichever batch this DataLoader produces evenly across GPUs at
+  the *model* level, so all the multi-GPU logic lives in train_finetune.py.
+  The only thing that matters here is feeding the GPUs fast enough — see
+  num_workers / persistent_workers / prefetch_factor below.
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -22,7 +29,7 @@ import numpy as np
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 
 
@@ -72,8 +79,8 @@ class BraTSPEDSliceDataset(Dataset):
         P    = self.patch_size
 
         # Random crop
-        top  = random.randint(0, H - P)
-        left = random.randint(0, W - P)
+        top  = random.randint(0, max(H - P, 0))
+        left = random.randint(0, max(W - P, 0))
         image = image[:, top:top+P, left:left+P]
         mask  = mask[   top:top+P, left:left+P]
 
@@ -107,8 +114,8 @@ class BraTSPEDSliceDataset(Dataset):
     def _centre_crop(self, image, mask):
         H, W = image.shape[1], image.shape[2]
         P    = self.patch_size
-        top  = (H - P) // 2
-        left = (W - P) // 2
+        top  = max((H - P) // 2, 0)
+        left = max((W - P) // 2, 0)
         return (image[:, top:top+P, left:left+P],
                 mask[   top:top+P, left:left+P])
 
@@ -116,21 +123,34 @@ class BraTSPEDSliceDataset(Dataset):
 def get_finetune_loaders(slices_dir:  str,
                          patch_size:  int = 192,
                          batch_size:  int = 8,
-                         num_workers: int = 2):
-    from torch.utils.data import DataLoader
+                         num_workers: int = 4):
+    """
+    Build train/val DataLoaders.
 
+    num_workers default bumped 2 -> 4: with 2 GPUs training in parallel via
+    DataParallel, the model consumes batches roughly 2x faster, so the
+    CPU-side data pipeline needs more worker processes to avoid GPUs sitting
+    idle waiting for data. persistent_workers + prefetch_factor keep the
+    workers warm between epochs instead of respawning every epoch.
+    """
     train_ds = BraTSPEDSliceDataset(
         slices_dir, "train", patch_size, augment=True)
     val_ds   = BraTSPEDSliceDataset(
         slices_dir, "val",   patch_size, augment=False)
 
+    common_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+    if num_workers > 0:
+        common_kwargs["prefetch_factor"] = 4
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
-        shuffle=True,  num_workers=num_workers,
-        pin_memory=True, drop_last=True)
+        shuffle=True, drop_last=True, **common_kwargs)
     val_loader   = DataLoader(
         val_ds,   batch_size=batch_size,
-        shuffle=False, num_workers=num_workers,
-        pin_memory=True)
+        shuffle=False, **common_kwargs)
 
     return train_loader, val_loader
