@@ -24,7 +24,7 @@ model:
   group_norm_groups: 8
 
 training:
-  epochs:           100        # replaces phase1_epochs (30) + phase2_epochs (70)
+  epochs:           30        # replaces phase1_epochs (30) + phase2_epochs (70)
   lr:               0.00005    # single LR for the whole model — replaces phase1_lr/phase2_lr
 
   # Cosine warm restarts

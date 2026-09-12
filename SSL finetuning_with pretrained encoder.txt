@@ -1,0 +1,102 @@
+[Weight Transfer] Matched 48 / 48 pretrained layers
+  Direct matches : 47
+  Adapted (group-averaged):
+    enc1.convs.0.block.0.weight: (48, 147, 3, 3) → averaged 7 groups → (48, 21, 3, 3) (||W|| 0.339 -> 0.065)
+  ✓ ALL 48 pretrained encoder layers loaded
+  ✓ Perfect transfer: all 48 encoder layers loaded
+  Model params: 1,948,636 total | 1,948,636 trainable
+
+✓ Loaded best model from epoch 29 (best val Dice at save time: 0.8561)
+[Dataset BraTS-PED] train: 11121 slices
+[Dataset BraTS-PED] val: 1871 slices
+Eval (raw): 100%
+ 117/117 [00:27<00:00,  4.32batch/s, WT=0.843, TC=0.840, ET=0.877]
+
+────────────────────────────────────────
+  FINAL EVALUATION (RAW, NO TTA) METRICS
+────────────────────────────────────────
+  Dice WT             : 0.8434
+  Dice TC             : 0.8396
+  Dice ET             : 0.8769
+  Mean Dice           : 0.8533
+  HD95 WT             : 34.3630
+  HD95 TC             : 33.9654
+  HD95 ET             : 33.2641
+────────────────────────────────────────
+
+Eval (TTA): 100%
+ 117/117 [02:01<00:00,  1.03s/batch, WT=0.847, TC=0.843, ET=0.878]
+
+────────────────────────────────────────
+  FINAL EVALUATION (5-WAY TTA) METRICS
+────────────────────────────────────────
+  Dice WT             : 0.8470
+  Dice TC             : 0.8432
+  Dice ET             : 0.8781
+  Mean Dice           : 0.8561
+  HD95 WT             : 35.2914
+  HD95 TC             : 34.9277
+  HD95 ET             : 33.3191
+────────────────────────────────────────
+
+
+TTA gain on Mean Dice: +0.0028
+
+
+------------------------------------------------------------------------
+
+Val   [44/100]: 100%|██████████| 117/117 [01:15<00:00,  1.54batch/s, WT=0.822, TC=0.805, ET=0.882, gpu=g0=0.1G|g1=0.0G]
+  Train -- total: 0.1483 | dice: 0.1380 | focal: 0.0103
+  Val   -- WT: 0.8224 | TC: 0.8047 | ET: 0.8824 | Mean: 0.8365
+  HD95  -- WT: 38.45 | TC: 40.59 | ET: 28.96
+  LR: 1.73e-05
+  No improvement for 15/15 epochs (best: 0.8561)
+
+Early stopping at epoch 44 (no improvement for 15 epochs)
+
+Training complete. Best val Dice: 0.8561
+
+------------------------------------------------------------------------------------
+
+    3D patient level volumetric evaluation(ssl finetuning with pretrained encoder)
+
+
+    [Weight Transfer] Matched 48 / 48 pretrained layers
+  Direct matches : 47
+  Adapted (group-averaged):
+    enc1.convs.0.block.0.weight: (48, 147, 3, 3) → averaged 7 groups → (48, 21, 3, 3) (||W|| 0.339 -> 0.065)
+  ✓ ALL 48 pretrained encoder layers loaded
+  ✓ Perfect transfer: all 48 encoder layers loaded
+  Model params: 1,948,636 total | 1,948,636 trainable
+
+✓ Loaded best model from epoch 29 (best val Dice at save time: 0.8561)
+
+14 val patients found (1871 slices total)
+Patients: 100%
+ 14/14 [04:11<00:00, 19.10s/pt, WT=0.776, TC=0.770, ET=0.580]
+
+────────────────────────────────────────
+  3D VOLUMETRIC EVALUATION, PER-PATIENT (5-WAY TTA) METRICS
+────────────────────────────────────────
+  Dice WT             : 0.7755
+  Dice TC             : 0.7699
+  Dice ET             : 0.5801
+  Mean Dice           : 0.7085
+  HD95 WT             : 15.9508
+  HD95 TC             : 15.9455
+  HD95 ET             : 93.0795
+────────────────────────────────────────
+
+
+Evaluated 14 patients.
+Per-patient results (sorted by Dice WT, worst first — good for spotting outlier cases):
+  BraTS-PED-00021-000            n_slices=117 | WT=0.077 TC=0.077 ET=0.000 | HD95 WT=48.8 TC=48.8 ET=373.1
+  BraTS-PED-00099-000            n_slices=135 | WT=0.530 TC=0.530 ET=0.227 | HD95 WT=57.5 TC=57.5 ET=80.1
+  BraTS-PED-00051-000            n_slices=135 | WT=0.559 TC=0.559 ET=1.000 | HD95 WT=30.4 TC=30.4 ET=0.0
+  BraTS-PED-00119-000            n_slices=135 | WT=0.800 TC=0.801 ET=0.854 | HD95 WT=45.8 TC=45.2 ET=3.7
+  BraTS-PED-00109-000            n_slices=135 | WT=0.800 TC=0.784 ET=0.788 | HD95 WT=11.0 TC=10.3 ET=5.7
+  BraTS-PED-00003-000            n_slices=135 | WT=0.830 TC=0.815 ET=0.892 | HD95 WT=5.1 TC=5.1 ET=3.0
+  BraTS-PED-00063-000            n_slices=134 | WT=0.848 TC=0.848 ET=0.861 | HD95 WT=3.7 TC=3.7 ET=10.3
+  BraTS-PED-00126-000            n_slices=135 | WT=0.875 TC=0.875 ET=0.762 | HD95 WT=3.6 TC=3.6 ET=3.0
+  BraTS-PED-00121-000            n_slices=135 | WT=0.893 TC=0.888 ET=0.868 | HD95 WT=4.1 TC=4.1 ET=3.2
+  BraTS-PED-00137-000            n_slices=135 | WT=0.893 TC=0.888 ET=0.868 | HD95 WT=4.1 TC=4.1 ET=3.2

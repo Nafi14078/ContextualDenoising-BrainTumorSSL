@@ -245,6 +245,7 @@ class SegUNet2D(nn.Module):
     # ── Pretrained weight loading ─────────────────────────────────────────────
 
     def load_pretrained_encoder(self, pretrained_path: str,
+                                adapt_mode: str = "sum",
                                 verbose: bool = True) -> int:
         """
         Load encoder weights from pretraining checkpoint.
@@ -255,26 +256,45 @@ class SegUNet2D(nn.Module):
 
         Why this mismatch exists:
           During pretraining, enc1 receives N=7 stacked feature maps
-          (7 × 21 = 147 input channels). During fine-tuning, enc1
-          receives just the feature_extractor output (21 channels).
+          (7 x 21 = 147 input channels) and computes
+              output = sum_g conv(x_g, W_g)
+          — 7 sub-kernels, each applied to a different neighboring slice,
+          SUMMED together. During fine-tuning, enc1 receives just ONE
+          slice's feature_extractor output (21 channels), so we need a
+          single (48, 21, 3, 3) kernel W' that approximates that sum.
 
-        Fix: reshape pretrained weight (48, 147, 3, 3) →
-             (48, 7, 21, 3, 3), average over the 7 groups →
-             (48, 21, 3, 3). This preserves the learned filter
-             structure while adapting to the new input dimension.
+        adapt_mode controls how the 7 sub-kernels W_1..W_7 are combined:
+          "sum"    (default) : W' = sum_g W_g
+                     If a single input slice is roughly representative of
+                     what each of the 7 window slices looked like, this
+                     approximates the ORIGINAL combined output magnitude.
+                     This is the standard "kernel deflation" approach —
+                     the inverse of the well-known inflation trick used
+                     when going from single-frame to multi-frame kernels.
+          "mean"   (legacy)  : W' = mean_g W_g
+                     Shrinks output magnitude by roughly 1/7 relative to
+                     pretraining — the encoder starts noticeably "quieter"
+                     than the downstream GroupNorm/GELU were calibrated
+                     for. Kept only for backward compatibility / ablation.
+          "center" : W' = W_{N//2}
+                     Uses only the middle group's kernel (index 3 of 0-6),
+                     on the assumption the center slice in the sliding
+                     window acted as the anchor/target frame during
+                     pretraining, so its sub-kernel alone may already be
+                     reasonably calibrated for single-frame input. Worth
+                     trying as an ablation if "sum" doesn't help.
 
-        Note on scale: averaging (rather than summing) the 7 groups means
-        this layer's output magnitude at init will generally be smaller
-        than it was during pretraining (pretraining summed the contribution
-        of 7 different input slices; fine-tuning applies the averaged
-        kernel to a single slice). GroupNorm right after this layer absorbs
-        most of that scale shift, but since Phase 1 freezes the encoder for
-        `phase1_epochs`, this layer stays exactly as adapted for the whole
-        of Phase 1. The printout below reports the weight-norm before/after
-        adaptation so you can sanity-check it is not wildly off.
+        Prints per-group weight norms so you can sanity-check which mode
+        is actually justified for YOUR pretrained checkpoint (e.g. if the
+        7 groups have wildly different norms, that's evidence the model
+        learned to weight them unevenly, and "sum" is a better bet than
+        "mean"; if they're all similar, either is defensible).
 
         Returns: number of matched layers (expect 48 after fix)
         """
+        assert adapt_mode in ("sum", "mean", "center"), \
+            f"adapt_mode must be 'sum', 'mean', or 'center', got {adapt_mode!r}"
+
         pretrained = torch.load(pretrained_path, map_location="cpu")
         model_dict = self.state_dict()
 
@@ -296,20 +316,31 @@ class SegUNet2D(nn.Module):
                 elif (k == MISMATCH_KEY
                       and v.shape[1] == model_dict[k].shape[1] * N_GROUPS):
                     # Known mismatch: (48, 147, 3, 3) → (48, 21, 3, 3)
-                    # Average across the N_GROUPS of feat_ch channels
                     out_ch, in_ch_total, kH, kW = v.shape
                     feat_ch = model_dict[k].shape[1]   # 21
                     pre_norm = v.norm().item()
-                    adapted_weight = (
-                        v.view(out_ch, N_GROUPS, feat_ch, kH, kW)
-                         .mean(dim=1)                  # (48, 21, 3, 3)
-                    )
+
+                    grouped = v.view(out_ch, N_GROUPS, feat_ch, kH, kW)
+                    per_group_norms = [
+                        grouped[:, g].norm().item() for g in range(N_GROUPS)
+                    ]
+
+                    if adapt_mode == "sum":
+                        adapted_weight = grouped.sum(dim=1)
+                    elif adapt_mode == "mean":
+                        adapted_weight = grouped.mean(dim=1)
+                    else:  # "center"
+                        adapted_weight = grouped[:, N_GROUPS // 2]
+
                     post_norm = adapted_weight.norm().item()
                     matched[k] = adapted_weight
-                    adapted.append(
-                        f"{k}: {tuple(v.shape)} → averaged "
-                        f"{N_GROUPS} groups → {tuple(adapted_weight.shape)} "
-                        f"(||W|| {pre_norm:.3f} -> {post_norm:.3f})")
+                    adapted.append({
+                        'key': k,
+                        'summary': (f"{k}: {tuple(v.shape)} -> [{adapt_mode}] "
+                                   f"{N_GROUPS} groups -> {tuple(adapted_weight.shape)} "
+                                   f"(||W|| {pre_norm:.3f} -> {post_norm:.3f})"),
+                        'per_group': ", ".join(f"{n:.3f}" for n in per_group_norms),
+                    })
 
                 else:
                     misshape.append(
@@ -322,14 +353,15 @@ class SegUNet2D(nn.Module):
         self.load_state_dict(model_dict, strict=False)
 
         if verbose:
-            direct  = len(matched) - len(adapted)
+            direct = len(matched) - len(adapted)
             print(f"[Weight Transfer] Matched {len(matched)} / "
                   f"{len(pretrained)} pretrained layers")
             print(f"  Direct matches : {direct}")
             if adapted:
-                print(f"  Adapted (group-averaged):")
+                print(f"  Adapted (mode='{adapt_mode}'):")
                 for a in adapted:
-                    print(f"    {a}")
+                    print(f"    {a['summary']}")
+                    print(f"      per-group ||W_g||: {a['per_group']}")
             if len(matched) == len(pretrained):
                 print("  ✓ ALL 48 pretrained encoder layers loaded")
             if misshape:
@@ -409,7 +441,8 @@ def build_model(cfg: dict, device) -> SegUNet2D:
     pretrained_path = cfg["model"].get("pretrained_encoder", None)
     if pretrained_path:
         if Path(pretrained_path).exists():
-            matched = model.load_pretrained_encoder(pretrained_path)
+            adapt_mode = cfg["model"].get("encoder_adapt_mode", "sum")
+            matched = model.load_pretrained_encoder(pretrained_path, adapt_mode=adapt_mode)
             if matched == 0:
                 print("[WARN] No layers matched — check encoder architecture "
                       "matches pretraining UNetDenoiser exactly.")
