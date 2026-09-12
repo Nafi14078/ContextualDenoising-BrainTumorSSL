@@ -3,8 +3,8 @@ finetuning/losses.py
 ────────────────────────────────────────────────────────────────────────────────
 Segmentation losses for BraTS-PED fine-tuning.
 
-  • DiceLoss        : soft Dice per class, averaged
-  • FocalLoss       : handles class imbalance (small tumors)
+  • DiceLoss        : soft Dice per class, averaged (now optionally WEIGHTED)
+  • FocalLoss       : handles class imbalance (now optionally WEIGHTED per class)
   • CombinedLoss    : Dice + λ·Focal  (default λ=1)
 
 BraTS label convention:
@@ -18,13 +18,20 @@ Evaluation sub-regions (computed from raw labels):
   TC (tumor core)       = labels {1, 3}
   ET (enhancing tumor)  = label  {3}
 
-NOTE: No bugs were found in this file during review — it is included
-unchanged so you have a complete, matching set of the four fine-tuning
-files. It also works as-is with the multi-GPU setup in train_finetune.py:
-the loss module has no learnable parameters, so nn.DataParallel replicating
-it across GPUs is a no-op cost-wise.
+CHANGE (this version): added optional per-class weighting to both losses.
+ET is consistently the hardest, most fragile region (smallest, most
+fine-grained, most affected by class imbalance during training). Both
+DiceLoss and FocalLoss previously treated all foreground classes equally
+when averaging — this let a model that's very good at NCR/ED (larger,
+easier structures) mask mediocre ET performance in the aggregate training
+signal. Passing higher weights for ET pushes the optimizer to actually
+prioritize getting it right, rather than letting it be diluted by the
+easier classes. Defaults to uniform weights (1.0 everywhere) if you don't
+pass anything, so this is fully backward compatible.
 ────────────────────────────────────────────────────────────────────────────────
 """
+
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -33,18 +40,35 @@ import torch.nn.functional as F
 
 class DiceLoss(nn.Module):
     """
-    Soft Dice loss averaged over foreground classes (ignores background).
-    Works on raw logits — applies softmax internally.
+    Soft Dice loss, optionally weighted per class, averaged over foreground
+    classes (ignores background). Works on raw logits — applies softmax
+    internally.
     """
 
     def __init__(self,
                  num_classes:   int   = 4,
                  smooth:        float = 1e-5,
-                 ignore_bg:     bool  = True):
+                 ignore_bg:     bool  = True,
+                 class_weights: Optional[Sequence[float]] = None):
+        """
+        class_weights: one weight per FOREGROUND class, in label order
+          (e.g. [w_NCR, w_ED, w_ET] for the default ignore_bg=True case).
+          Higher weight = that class's Dice loss counts for more in the
+          average. None (default) = uniform weighting = original behavior.
+        """
         super().__init__()
         self.num_classes = num_classes
         self.smooth      = smooth
         self.ignore_bg   = ignore_bg
+
+        n_fg = num_classes - (1 if ignore_bg else 0)
+        if class_weights is None:
+            class_weights = [1.0] * n_fg
+        assert len(class_weights) == n_fg, (
+            f"class_weights must have {n_fg} entries (one per foreground "
+            f"class), got {len(class_weights)}")
+        self.register_buffer(
+            "class_weights", torch.tensor(class_weights, dtype=torch.float32))
 
     def forward(self,
                 logits: torch.Tensor,
@@ -71,12 +95,15 @@ class DiceLoss(nn.Module):
                            (union + self.smooth)
             dice_per_class.append(1. - dice.mean())
 
-        return torch.stack(dice_per_class).mean()
+        dice_per_class = torch.stack(dice_per_class)             # (n_fg,)
+        weights = self.class_weights.to(dice_per_class.device)
+        return (dice_per_class * weights).sum() / weights.sum()
 
 
 class FocalLoss(nn.Module):
     """
-    Focal loss for multi-class segmentation.
+    Focal loss for multi-class segmentation, optionally with an additional
+    per-class weight on top of the standard focal (1-p_t)^gamma term.
     Reduces loss for easy (well-classified) pixels, focuses on hard ones.
     Essential for BraTS where tumor voxels << background voxels.
     """
@@ -84,11 +111,26 @@ class FocalLoss(nn.Module):
     def __init__(self,
                  gamma: float = 2.0,
                  alpha: float = 0.25,
-                 num_classes: int = 4):
+                 num_classes: int = 4,
+                 class_weights: Optional[Sequence[float]] = None):
+        """
+        class_weights: one weight per class, INCLUDING background, in label
+          order (e.g. [w_bg, w_NCR, w_ED, w_ET]). Applied per-pixel based on
+          that pixel's true class, multiplicatively alongside `alpha`.
+          None (default) = uniform weighting = original behavior.
+        """
         super().__init__()
         self.gamma       = gamma
         self.alpha       = alpha
         self.num_classes = num_classes
+
+        if class_weights is None:
+            class_weights = [1.0] * num_classes
+        assert len(class_weights) == num_classes, (
+            f"class_weights must have {num_classes} entries (one per "
+            f"class, including background), got {len(class_weights)}")
+        self.register_buffer(
+            "class_weights", torch.tensor(class_weights, dtype=torch.float32))
 
     def forward(self,
                 logits:  torch.Tensor,
@@ -111,7 +153,11 @@ class FocalLoss(nn.Module):
         # Focal weight
         focal_weight = self.alpha * (1.0 - p_t) ** self.gamma
 
-        focal_loss = (focal_weight * ce_loss).mean()
+        # Per-pixel class weight, gathered from each pixel's true label
+        weights = self.class_weights.to(logits.device)
+        pixel_class_weight = weights[targets]                # (B, H, W)
+
+        focal_loss = (pixel_class_weight * focal_weight * ce_loss).mean()
         return focal_loss
 
 
@@ -121,14 +167,23 @@ class CombinedSegLoss(nn.Module):
     """
 
     def __init__(self,
-                 num_classes:   int   = 4,
-                 dice_weight:   float = 1.0,
-                 focal_weight:  float = 1.0,
-                 focal_gamma:   float = 2.0,
-                 focal_alpha:   float = 0.25):
+                 num_classes:         int   = 4,
+                 dice_weight:         float = 1.0,
+                 focal_weight:        float = 1.0,
+                 focal_gamma:         float = 2.0,
+                 focal_alpha:         float = 0.25,
+                 dice_class_weights:  Optional[Sequence[float]] = None,
+                 focal_class_weights: Optional[Sequence[float]] = None):
+        """
+        dice_class_weights  : per-FOREGROUND-class weights for DiceLoss,
+          e.g. [1.0, 1.0, 2.0] to weight ET 2x NCR/ED. None = uniform.
+        focal_class_weights : per-class weights for FocalLoss, INCLUDING
+          background, e.g. [1.0, 1.0, 1.0, 2.0]. None = uniform.
+        """
         super().__init__()
-        self.dice  = DiceLoss(num_classes)
-        self.focal = FocalLoss(focal_gamma, focal_alpha, num_classes)
+        self.dice  = DiceLoss(num_classes, class_weights=dice_class_weights)
+        self.focal = FocalLoss(focal_gamma, focal_alpha, num_classes,
+                               class_weights=focal_class_weights)
         self.w_dice  = dice_weight
         self.w_focal = focal_weight
 

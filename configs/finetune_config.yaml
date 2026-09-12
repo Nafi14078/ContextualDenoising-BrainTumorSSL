@@ -15,8 +15,15 @@ data:
   val_split:        0.15
   num_classes:      4
 
+  # ET oversampling: most slices contain little/no ET (your weakest,
+  # smallest, most imbalanced region), so this samples ET-positive train
+  # slices `et_oversample_factor`x more often than the rest.
+  oversample_et:        true
+  et_oversample_factor: 5.0
+
 model:
   pretrained_encoder: "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/pretrain_encoder_best.pth"
+  encoder_adapt_mode: sum       # "sum" (recommended fix) | "mean" (old, causes ~7x undershoot) | "center"
   in_channels:      4
   out_channels:     4
   base_channels:    48
@@ -24,7 +31,7 @@ model:
   group_norm_groups: 8
 
 training:
-  epochs:           30        # replaces phase1_epochs (30) + phase2_epochs (70)
+  epochs:           100        # replaces phase1_epochs (30) + phase2_epochs (70)
   lr:               0.00005    # single LR for the whole model — replaces phase1_lr/phase2_lr
 
   # Cosine warm restarts
@@ -48,6 +55,13 @@ loss:
   focal_weight:     1.0
   focal_gamma:      2.0
   focal_alpha:      0.25
+
+  # Per-class weighting: push the optimizer to prioritize ET (your weakest
+  # region) instead of letting it be diluted by the easier NCR/ED classes.
+  # dice_class_weights  order: [NCR, ED, ET]      (foreground only)
+  # focal_class_weights order: [bg, NCR, ED, ET]  (includes background)
+  dice_class_weights:  [1.0, 1.0, 2.0]
+  focal_class_weights: [1.0, 1.0, 1.0, 2.0]
 
 logging:
   log_every:        50

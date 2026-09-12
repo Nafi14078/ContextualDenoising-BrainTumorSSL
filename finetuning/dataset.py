@@ -54,6 +54,29 @@ class BraTSPEDSliceDataset(Dataset):
 
         print(f"[Dataset BraTS-PED] {split}: {len(self.fnames)} slices")
 
+    def compute_et_sample_weights(self, et_oversample_factor: float = 5.0) -> list:
+        """
+        Scans every training mask ONCE (fast — just reading small uint8
+        .npy arrays, no image loading) and returns a per-sample weight list:
+        `et_oversample_factor` for slices containing any ET (label 3)
+        pixels, 1.0 for everything else. Feed this into a
+        torch.utils.data.WeightedRandomSampler to oversample ET-positive
+        slices during training — ET is your weakest, most imbalanced
+        region, and most slices in this dataset contain little/no ET.
+        """
+        weights = []
+        n_et_positive = 0
+        for fname in self.fnames:
+            mask = np.load(self.mask_dir / fname, mmap_mode='r')
+            is_et = bool((mask == 3).any())
+            weights.append(et_oversample_factor if is_et else 1.0)
+            n_et_positive += is_et
+
+        print(f"[Dataset BraTS-PED] {n_et_positive}/{len(self.fnames)} "
+              f"train slices contain ET — weighted {et_oversample_factor}x "
+              f"vs 1.0x for the rest")
+        return weights
+
     def __len__(self):
         return len(self.fnames)
 
@@ -123,7 +146,9 @@ class BraTSPEDSliceDataset(Dataset):
 def get_finetune_loaders(slices_dir:  str,
                          patch_size:  int = 192,
                          batch_size:  int = 8,
-                         num_workers: int = 4):
+                         num_workers: int = 4,
+                         oversample_et: bool = False,
+                         et_oversample_factor: float = 5.0):
     """
     Build train/val DataLoaders.
 
@@ -132,6 +157,16 @@ def get_finetune_loaders(slices_dir:  str,
     CPU-side data pipeline needs more worker processes to avoid GPUs sitting
     idle waiting for data. persistent_workers + prefetch_factor keep the
     workers warm between epochs instead of respawning every epoch.
+
+    oversample_et: if True, builds a WeightedRandomSampler that samples
+      ET-positive train slices `et_oversample_factor`x more often than
+      other slices — most slices in this dataset have little/no ET, which
+      dilutes the training signal for your weakest, most imbalanced
+      region. Mutually exclusive with `shuffle=True` (a sampler replaces
+      plain shuffling; it still draws a random slice each time, just with
+      non-uniform probability), so shuffle is dropped automatically when
+      this is on. `drop_last=True` is kept either way for stable batch
+      shapes under multi-GPU.
     """
     train_ds = BraTSPEDSliceDataset(
         slices_dir, "train", patch_size, augment=True)
@@ -146,10 +181,19 @@ def get_finetune_loaders(slices_dir:  str,
     if num_workers > 0:
         common_kwargs["prefetch_factor"] = 4
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size,
-        shuffle=True, drop_last=True, **common_kwargs)
-    val_loader   = DataLoader(
+    if oversample_et:
+        sample_weights = train_ds.compute_et_sample_weights(et_oversample_factor)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size,
+            sampler=sampler, drop_last=True, **common_kwargs)
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size,
+            shuffle=True, drop_last=True, **common_kwargs)
+
+    val_loader = DataLoader(
         val_ds,   batch_size=batch_size,
         shuffle=False, **common_kwargs)
 

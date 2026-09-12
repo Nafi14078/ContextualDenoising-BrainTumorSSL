@@ -480,7 +480,9 @@ def main(cfg_path, resume_path=None):
         slices_dir  = cfg["data"]["output_slices"],
         patch_size  = cfg["data"]["patch_size"],
         batch_size  = cfg["training"]["batch_size"],
-        num_workers = cfg["training"].get("num_workers", 4))
+        num_workers = cfg["training"].get("num_workers", 4),
+        oversample_et = cfg["data"].get("oversample_et", False),
+        et_oversample_factor = float(cfg["data"].get("et_oversample_factor", 5.0)))
 
     if n_gpus > 1:
         per_gpu = cfg["training"]["batch_size"] // n_gpus
@@ -499,7 +501,9 @@ def main(cfg_path, resume_path=None):
         dice_weight  = float(cfg["loss"]["dice_weight"]),
         focal_weight = float(cfg["loss"]["focal_weight"]),
         focal_gamma  = float(cfg["loss"]["focal_gamma"]),
-        focal_alpha  = float(cfg["loss"]["focal_alpha"]))
+        focal_alpha  = float(cfg["loss"]["focal_alpha"]),
+        dice_class_weights  = cfg["loss"].get("dice_class_weights", None),
+        focal_class_weights = cfg["loss"].get("focal_class_weights", None))
 
     # train_model: used ONLY for the forward+backward training pass.
     # Wraps model+loss together so DataParallel gathers small scalars
