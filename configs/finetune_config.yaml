@@ -18,8 +18,11 @@ data:
   # ET oversampling: most slices contain little/no ET (your weakest,
   # smallest, most imbalanced region), so this samples ET-positive train
   # slices `et_oversample_factor`x more often than the rest.
+  # NOTE: was 5.0 — too aggressive, was squeezing out ED-heavy slice
+  # exposure and dragging WT dice down below TC/ET (abnormal ordering).
+  # Dialed back to 2.0 for a gentler oversample.
   oversample_et:        true
-  et_oversample_factor: 5.0
+  et_oversample_factor: 2.0
 
 model:
   pretrained_encoder: "/kaggle/input/datasets/ashfakazadnafi/bratsped-dataset/pretrain_encoder_best.pth"
